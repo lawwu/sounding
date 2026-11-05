@@ -158,7 +158,7 @@ and the Python MCP SDK is the reference implementation.
 uv run pytest
 ```
 
-The suite is offline and fails on unmocked BigQuery calls. Install Node.js 22+ for
+The suite is offline and fails on unmocked BigQuery calls. Install Node.js 24+ for
 the JavaScript security, pagination and stale-response tests (run by pytest;
 skipped with an explicit reason if Node is missing). CI installs Node and runs the
 full suite. Tests also cover process/thread locks, rollback, Arrow field mapping,
