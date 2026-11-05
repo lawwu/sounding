@@ -51,6 +51,36 @@ async function search(offset = 0) {
 
 function depth(path) { return (path.match(/\./g) || []).length; }
 
+function labelChips(labels) {
+  const entries = Object.entries(labels || {});
+  if (!entries.length) return "";
+  const shown = entries.slice(0, 8).map(([k, v]) => `<span class="chip label">${esc(k)}${v ? "=" + esc(v) : ""}</span>`).join("");
+  return `<div class="chips labels">${shown}${entries.length > 8 ? `<span class="hint">+${entries.length - 8} labels</span>` : ""}</div>`;
+}
+
+// Declared keys, storage and lineage. Missing values are unknown, so their rows are omitted.
+function detailsSection(t) {
+  const rows = [];
+  if (t.primary_key) rows.push(["Primary key", esc(t.primary_key.join(", ")) + ' <span class="hint">declared, not enforced</span>']);
+  for (const fk of t.foreign_keys || [])
+    rows.push(["Foreign key", `${esc(fk.columns.map(c => c[0]).join(", "))} → ${esc(fk.references)} (${esc(fk.columns.map(c => c[1]).join(", "))})`]);
+  const s = t.storage;
+  if (s) {
+    const part = (label, active, longTerm) => active != null || longTerm != null
+      ? `${label} ${bytes((active || 0) + (longTerm || 0))} <span class="hint">(${bytes(active)} active, ${bytes(longTerm)} long-term)</span>` : "";
+    const logical = part("logical", s.active_logical, s.long_term_logical);
+    const physical = part("physical", s.active_physical, s.long_term_physical);
+    const travel = s.time_travel_physical ? ` · time travel ${bytes(s.time_travel_physical)}` : "";
+    if (logical || physical) rows.push(["Storage", [logical, physical].filter(Boolean).join(" · ") + travel]);
+  }
+  if (t.base_table) rows.push([t.base_kind === "SNAPSHOT" ? "Snapshot of" : "Clone of", esc(t.base_table)]);
+  if (t.external) rows.push(["External source", esc([t.external.sourceFormat, ...(t.external.sourceUris || []).slice(0, 3)].filter(Boolean).join(" · "))]);
+  if (t.partition_expiration_ms != null) rows.push(["Partition expiry", `${num(t.partition_expiration_ms / 864e5)} days`]);
+  if (t.kms_key) rows.push(["Encryption", esc(t.kms_key)]);
+  if (!rows.length) return "";
+  return `<h3>Details</h3><dl class="details">${rows.map(([k, v]) => `<dt>${k}</dt><dd>${v}</dd>`).join("")}</dl>`;
+}
+
 function renderTable(t) {
   const view = viewSeq, render = ++renderSeq;
   const active = () => view === viewSeq && render === renderSeq && current === t.fqn;
@@ -66,11 +96,17 @@ function renderTable(t) {
       <span class="chip num">${bytes(t.num_bytes)}</span>
       <span class="chip cost" title="US on-demand scan estimate including the billing minimum; excludes free tier and discounts">full scan ${usd(fullUsd)}</span>
       <span class="chip" title="${esc(t.modified)}">modified ${ago(t.modified)}</span>
-      ${t.partitioning ? `<span class="chip">partitioned ${esc(t.partitioning)}</span>` : ""}
+      ${t.partitioning ? `<span class="chip">partitioned ${esc(t.partitioning)}${t.num_partitions != null ? ` · ${num(t.num_partitions)} partitions` : ""}</span>` : ""}
+      ${t.require_partition_filter ? `<span class="chip cost">partition filter required</span>` : ""}
       ${t.clustering ? `<span class="chip">clustered ${esc(t.clustering)}</span>` : ""}
+      ${t.location ? `<span class="chip">${esc(t.location)}</span>` : ""}
+      ${t.expires ? `<span class="chip cost" title="${esc(t.expires)}">expires ${esc(t.expires.slice(0, 10))}</span>` : ""}
       <span class="chip free">from catalog · free</span>
     </div>
+    ${labelChips(t.labels)}
     ${t.description ? `<p class="desc">${esc(t.description)}</p>` : ""}
+    ${(t.notes || []).length ? `<ul class="notes">${t.notes.map(n => `<li>${esc(n)}</li>`).join("")}</ul>` : ""}
+    ${detailsSection(t)}
 
     <h3>Schema <span class="hint">${t.columns.length} column paths</span>
       ${t.type === "TABLE" ? `<button id="costs">${hasCosts ? "Refresh" : "Compute"} column costs</button><span class="hint">one free dry run per top-level column</span>` : ""}</h3>
@@ -79,7 +115,8 @@ function renderTable(t) {
       const parts = c.path.split("."), leaf = parts.pop();
       const pre = parts.length ? `<span class="p">${esc(parts.join("."))}.</span>` : "";
       const bar = c.scan_bytes != null ? `<span class="bar" style="width:${Math.max(2, 120 * c.scan_bytes / maxScan)}px"></span><span class="num">${bytes(c.scan_bytes)}</span>` : "";
-      return `<tr><td class="path" style="padding-left:${8 + 14 * depth(c.path)}px">${pre}${esc(leaf)}</td><td class="type">${esc(c.type)}</td>
+      const tag = (c.policy_tags || []).length ? ` <span class="tag" title="${esc(c.policy_tags.join("\n"))}">policy tag</span>` : "";
+      return `<tr><td class="path" style="padding-left:${8 + 14 * depth(c.path)}px">${pre}${esc(leaf)}${tag}</td><td class="type">${esc(c.type)}</td>
         <td class="type">${esc(c.mode)}</td><td class="cost">${bar}</td>${hasDesc ? `<td>${esc(c.description)}</td>` : ""}</tr>`;
     }).join("")}</tbody></table>
 
@@ -145,7 +182,7 @@ $("#more").onclick = () => { if (nextOffset != null) search(nextOffset); };
 $("#list").addEventListener("click", e => { const r = e.target.closest(".r"); if (r) open(r.dataset.fqn); });
 document.addEventListener("keydown", e => { if (e.key === "/" && document.activeElement.tagName !== "INPUT" && document.activeElement.tagName !== "TEXTAREA") { e.preventDefault(); $("#q").focus(); } });
 
-api("/api/stats").then(s => { $("#stats").textContent = `${s.datasets} datasets · ${num(s.tables)} tables · ${bytes(s.bytes)} · harvested ${ago(s.harvested_at)}`; })
+api("/api/stats").then(s => { $("#stats").textContent = `${s.datasets} datasets · ${num(s.tables)} tables${s.routines ? ` · ${num(s.routines)} routines` : ""} · ${bytes(s.bytes)} · harvested ${ago(s.harvested_at)}`; })
   .catch(err => { $("#stats").textContent = err.message; });
 search();
 if (location.hash) open(decodeURIComponent(location.hash.slice(1)));

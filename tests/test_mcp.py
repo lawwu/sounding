@@ -15,6 +15,8 @@ def test_tool_schemas_and_bounds(monkeypatch):
     async def check():
         app=create_server()
         schemas={t.name:t.input_schema for t in await app.list_tools()}
+        assert {"describe_dataset","search_routines","describe_routine"} <= set(schemas)
+        assert schemas["search_routines"]["properties"]["limit"]["maximum"]==100
         n=schemas["preview_rows"]["properties"]["n"]
         assert n["minimum"]==1 and n["maximum"]==50
         assert schemas["search_catalog"]["properties"]["limit"]["maximum"]==100
@@ -23,6 +25,8 @@ def test_tool_schemas_and_bounds(monkeypatch):
             with pytest.raises(ToolError): await app.call_tool("preview_rows",{"table":"p.d.t","n":n})
         with pytest.raises(ToolError,match="latest catalog"):
             await app.call_tool("describe_table",{"table":"p.d.missing"})
+        with pytest.raises(ToolError,match="not in the catalog"):
+            await app.call_tool("describe_dataset",{"dataset":"p.missing"})
     asyncio.run(check())
 
 

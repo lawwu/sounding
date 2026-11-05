@@ -1,4 +1,4 @@
-"""The only module that calls BigQuery: metadata, dry runs, and tabledata.list only.
+"""The only module that calls BigQuery: metadata (datasets, tables, routines), dry runs, and tabledata.list only.
 
 No billed queries or Storage Read API calls are made, and the harvester never reads
 INFORMATION_SCHEMA. User SQL, INFORMATION_SCHEMA included, is only ever dry-run.
@@ -14,6 +14,7 @@ import os
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
+from google.api_core.exceptions import Forbidden
 from google.cloud import bigquery
 
 from . import catalog
@@ -29,24 +30,134 @@ def client() -> bigquery.Client:
     return bigquery.Client(project=JOB_PROJECT)
 
 
-def flatten(fields, prefix=""):
-    """Yield every field, including RECORD parents and nested/repeated children."""
+# Fields dropped before a REST resource is stored. The schema and view SQL are stored in
+# their own columns. Dataset `access` lists the people and groups with access (emails),
+# which a metadata catalog has no reason to keep.
+TABLE_DROP = {"schema", "view", "etag", "selfLink", "id", "kind"}
+DATASET_DROP = {"access", "etag", "selfLink", "id", "kind"}
+ROUTINE_DROP = {"etag"}
+STORAGE_FIELDS = {  # tables.get returns these by default; any may be absent (unknown).
+    "numActiveLogicalBytes": "active_logical", "numLongTermLogicalBytes": "long_term_logical",
+    "numTotalLogicalBytes": "total_logical", "numActivePhysicalBytes": "active_physical",
+    "numLongTermPhysicalBytes": "long_term_physical", "numTotalPhysicalBytes": "total_physical",
+    "numTimeTravelPhysicalBytes": "time_travel_physical", "numCurrentPhysicalBytes": "current_physical",
+}
+
+
+def flatten(fields: list[dict], prefix=""):
+    """Yield (path, field) for every REST schema field, including RECORD parents and children."""
     for f in fields:
-        path = f"{prefix}{f.name}"
+        path = f"{prefix}{f['name']}"
         yield path, f
-        if f.field_type in ("RECORD", "STRUCT"):
-            yield from flatten(f.fields, path + ".")
+        if f.get("type") in ("RECORD", "STRUCT"):
+            yield from flatten(f.get("fields", []), path + ".")
 
 
-def _partitioning(t) -> str | None:
-    if t.time_partitioning:
-        return f"{t.time_partitioning.type_}:{t.time_partitioning.field or '_PARTITIONTIME'}"
-    if t.range_partitioning:
-        return f"RANGE:{t.range_partitioning.field}"
+def _int(value) -> int | None:
+    """REST int64 fields arrive as strings; absent stays None (unknown), never 0."""
+    return None if value is None else int(value)
+
+
+def _ms(value) -> dt.datetime | None:
+    return None if value is None else dt.datetime.fromtimestamp(int(value) / 1000, dt.UTC)
+
+
+def _ref(r: dict | None, key="tableId") -> str | None:
+    return f"{r['projectId']}.{r['datasetId']}.{r[key]}" if r else None
+
+
+def _partitioning(r: dict) -> str | None:
+    if tp := r.get("timePartitioning"):
+        return f"{tp['type']}:{tp.get('field') or '_PARTITIONTIME'}"
+    if rp := r.get("rangePartitioning"):
+        return f"RANGE:{rp['field']}"
     return None
 
 
+def sql_type(t: dict | None) -> str | None:
+    """A GoogleSQL type name from a REST StandardSqlDataType."""
+    if not t:
+        return None
+    kind = t.get("typeKind")
+    if kind == "ARRAY":
+        return f"ARRAY<{sql_type(t.get('arrayElementType'))}>"
+    if kind == "STRUCT":
+        fields = t.get("structType", {}).get("fields", [])
+        return "STRUCT<" + ", ".join(f"{f.get('name', '')} {sql_type(f.get('type'))}".strip() for f in fields) + ">"
+    if kind == "RANGE":
+        return f"RANGE<{sql_type(t.get('rangeElementType'))}>"
+    return kind
+
+
+def table_record(r: dict, dataset: str) -> tuple[dict, list[dict]]:
+    """One tables.get response as a catalog row and its column rows."""
+    fqn = _ref(r["tableReference"])
+    partitioning = _partitioning(r)
+    constraints = r.get("tableConstraints") or {}
+    copy = r.get("snapshotDefinition") or r.get("cloneDefinition")
+    mv = r.get("materializedView")
+    storage = {name: int(r[key]) for key, name in STORAGE_FIELDS.items() if r.get(key) is not None}
+    # requirePartitionFilter moved from timePartitioning to the table; BigQuery omits false.
+    require = r.get("requirePartitionFilter", (r.get("timePartitioning") or {}).get("requirePartitionFilter"))
+    table = {
+        "dataset": dataset, "table_id": r["tableReference"]["tableId"], "fqn": fqn, "type": r.get("type"),
+        "num_rows": _int(r.get("numRows")), "num_bytes": _int(r.get("numBytes")),
+        "created": _ms(r.get("creationTime")), "modified": _ms(r.get("lastModifiedTime")),
+        "partitioning": partitioning,
+        "clustering": ",".join(r["clustering"]["fields"]) if r.get("clustering") else None,
+        "description": r.get("description"),
+        "view_sql": (r.get("view") or {}).get("query") or (mv or {}).get("query"),
+        "location": r.get("location"), "expires": _ms(r.get("expirationTime")),
+        "labels": r.get("labels") or {},
+        "require_partition_filter": bool(require) if partitioning else None,
+        "partition_expiration_ms": _int((r.get("timePartitioning") or {}).get("expirationMs")),
+        "num_partitions": _int(r.get("numPartitions")),
+        "primary_key": (constraints.get("primaryKey") or {}).get("columns"),
+        "foreign_keys": [{"name": fk.get("name"), "references": _ref(fk.get("referencedTable")),
+                          "columns": [[c["referencingColumn"], c["referencedColumn"]] for c in fk.get("columnReferences", [])]}
+                         for fk in constraints.get("foreignKeys", [])] or None,
+        "storage": storage or None,
+        "kms_key": (r.get("encryptionConfiguration") or {}).get("kmsKeyName"),
+        "base_table": _ref((copy or {}).get("baseTableReference")),
+        "base_kind": ("SNAPSHOT" if r.get("snapshotDefinition") else "CLONE") if copy else None,
+        "external": r.get("externalDataConfiguration"),
+        "materialized_view": ({k: v for k, v in mv.items() if k != "query"} | {"status": r.get("materializedViewStatus")}
+                              if mv else None),
+        "resource": {k: v for k, v in r.items() if k not in TABLE_DROP},
+    }
+    columns = [{"fqn": fqn, "path": path, "type": f.get("type"), "mode": f.get("mode", "NULLABLE"),
+                "description": f.get("description"), "policy_tags": (f.get("policyTags") or {}).get("names")}
+               for path, f in flatten((r.get("schema") or {}).get("fields", []))]
+    return table, columns
+
+
+def dataset_record(r: dict, dataset: str, routines_status: str) -> dict:
+    return {"dataset": dataset, "location": r.get("location"), "friendly_name": r.get("friendlyName"),
+            "description": r.get("description"), "labels": r.get("labels") or {},
+            "created": _ms(r.get("creationTime")), "modified": _ms(r.get("lastModifiedTime")),
+            "default_table_expiration_ms": _int(r.get("defaultTableExpirationMs")),
+            "default_partition_expiration_ms": _int(r.get("defaultPartitionExpirationMs")),
+            "storage_billing_model": r.get("storageBillingModel"),
+            "max_time_travel_hours": _int(r.get("maxTimeTravelHours")), "routines_status": routines_status,
+            "resource": {k: v for k, v in r.items() if k not in DATASET_DROP}}
+
+
+def routine_record(r: dict, dataset: str) -> dict:
+    ref = r["routineReference"]
+    return {"dataset": dataset, "routine_id": ref["routineId"], "fqn": _ref(ref, "routineId"),
+            "type": r.get("routineType"), "language": r.get("language"),
+            "arguments": [{"name": a.get("name"), "type": sql_type(a.get("dataType")),
+                           "mode": a.get("mode"), "kind": a.get("argumentKind")} for a in r.get("arguments", [])],
+            "return_type": sql_type(r.get("returnType")) or (
+                "TABLE<" + ", ".join(f"{c['name']} {sql_type(c.get('type'))}" for c in r["returnTableType"]["columns"]) + ">"
+                if r.get("returnTableType") else None),
+            "description": r.get("description"), "definition": r.get("definitionBody"),
+            "created": _ms(r.get("creationTime")), "modified": _ms(r.get("lastModifiedTime")),
+            "resource": {k: v for k, v in r.items() if k not in ROUTINE_DROP}}
+
+
 def harvest(datasets: list[str]) -> None:
+    """Free metadata calls only: datasets.get, tables.list/get and routines.list/get."""
     # Fail early on unsupported catalogs, but release the connection before network I/O.
     with catalog.connect():
         pass
@@ -54,25 +165,31 @@ def harvest(datasets: list[str]) -> None:
     for raw_ds in datasets:
         text(raw_ds, "dataset")
         try:
-            ds = str(bigquery.DatasetReference.from_string(raw_ds, default_project=c.project))
+            ref = bigquery.DatasetReference.from_string(raw_ds, default_project=c.project)
         except ValueError as error:
             raise SoundingError("Dataset must be dataset or project.dataset.") from error
+        ds = str(ref)
+        dataset_resource = c.get_dataset(ref).to_api_repr()
         refs = [i.reference for i in c.list_tables(ds)]
         with ThreadPoolExecutor(GET_TABLE_WORKERS) as pool:
             fetched = list(pool.map(c.get_table, refs))
+            try:
+                routine_refs = [i.reference for i in c.list_routines(ds)]
+                routines = list(pool.map(c.get_routine, routine_refs))
+                routines_status = "harvested"
+            except Forbidden:
+                # Routine access is a separate permission; tables are still worth keeping.
+                routines, routines_status = [], "denied"
         table_rows, col_rows = [], []
         for t in fetched:
-            fqn = f"{t.project}.{t.dataset_id}.{t.table_id}"
-            table_rows.append({
-                "dataset": ds, "table_id": t.table_id, "fqn": fqn,
-                "type": t.table_type, "num_rows": t.num_rows, "num_bytes": t.num_bytes,
-                "created": t.created, "modified": t.modified, "partitioning": _partitioning(t),
-                "clustering": ",".join(t.clustering_fields) if t.clustering_fields else None,
-                "description": t.description, "view_sql": t.view_query})
-            col_rows += [{"fqn": fqn, "path": p, "type": f.field_type,
-                          "mode": f.mode, "description": f.description} for p, f in flatten(t.schema)]
-        sid = catalog.save_snapshot(ds, table_rows, col_rows)
-        print(f"{ds}: {len(fetched)} tables, {len(col_rows)} column paths (snapshot {sid})",
+            table, columns = table_record(t.to_api_repr(), ds)
+            table_rows.append(table)
+            col_rows += columns
+        routine_rows = [routine_record(r.to_api_repr(), ds) for r in routines]
+        sid = catalog.save_snapshot(ds, table_rows, col_rows,
+                                    dataset_record(dataset_resource, ds, routines_status), routine_rows)
+        extra = f", {len(routine_rows)} routines" if routines_status == "harvested" else ", routines denied"
+        print(f"{ds}: {len(fetched)} tables, {len(col_rows)} column paths{extra} (snapshot {sid})",
               file=sys.stderr)
 
 

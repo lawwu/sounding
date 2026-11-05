@@ -14,10 +14,12 @@ Sounding answers each question from the cheapest source that can.
 | Source | What you get | Cost |
 | --- | --- | --- |
 | Local catalog | Everything already harvested, plus snapshot history | $0, no BigQuery call |
-| REST `tables.list` / `tables.get` | Schema (nested), descriptions, row and byte counts, last modified, partitioning, clustering, view SQL | $0 (API quota) |
+| REST `tables.list` / `tables.get` | Schema (nested), descriptions, row and byte counts, last modified, partitioning, clustering, view SQL, plus everything else in the [table resource](https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/tables) (see below) | $0 (API quota) |
+| REST `datasets.get` | Location, description, labels, default expirations, storage billing model, time-travel window | $0 (API quota) |
+| REST `routines.list` / `routines.get` | Functions and procedures: type, language, signature, return type, description, body | $0 (API quota) |
 | `tabledata.list` | Sample rows (tables only, not views) | $0 |
 | Dry run | Estimated bytes, reported referenced tables, and estimate limitations | $0 |
-| INFORMATION_SCHEMA | Partitions, storage, job history | 10 MB minimum for on-demand queries; capacity queries consume slots; never cached: **not harvested** (the cost guard can still dry-run it for free) |
+| INFORMATION_SCHEMA | Per-partition details, job history | 10 MB minimum for on-demand queries; capacity queries consume slots; never cached: **not harvested** (the cost guard can still dry-run it for free) |
 | Sampled profiles | `TABLESAMPLE` + `APPROX_*` | Billed: **not used yet** (planned as opt-in, capped, approved) |
 
 Two free tricks come from dry runs:
@@ -76,15 +78,49 @@ wait up to 10 seconds for another local operation, then return a retryable error
 Keep the catalog on a local filesystem; external DuckDB programs do not participate
 in this coordination and must close their connections before Sounding opens it.
 
+### What a harvest keeps
+
+Each `tables.get` response is kept whole (minus the schema, which is stored per column),
+so nothing BigQuery returns is thrown away. These fields are also pulled out for
+search, `describe` and the UI, at no extra BigQuery cost:
+
+- **Declared keys:** primary and foreign keys. BigQuery does not enforce them, so they
+  are join hints, not proof.
+- **Partition guidance:** whether a partition filter is required, partition expiry,
+  and the partition count.
+- **Storage:** active and long-term bytes, logical and physical, and time-travel bytes.
+- **Governance and lifecycle:** labels, column policy tags, expiry time, the encryption
+  key, and the source table of a snapshot or clone.
+- **External and materialized tables:** the external source settings, and a
+  materialized view's query, refresh settings and status.
+
+A missing field is stored as unknown (`null`), never as zero or false. `describe`
+adds plain-language `notes` for things to know before querying, such as a required
+partition filter or policy-tagged columns.
+
+Each harvest also calls `datasets.get` once and harvests the dataset's routines. The
+dataset's `access` list (who can read it, by email) is never stored. If routines
+can't be listed, the tables are still saved and the dataset shows `routines_status: denied`.
+
+```bash
+uv run sounding dataset bigquery-public-data.persistent_udfs   # settings and routine signatures
+uv run sounding routines bignumber                             # search functions and procedures
+uv run sounding routine bigquery-public-data.persistent_udfs.bignumber_add
+```
+
 ### Catalog upgrades
 
-This version uses catalog schema 2. The catalog is a cache that a harvest can rebuild,
-and older schemas can't be converted reliably (timezone-less timestamps, alias-keyed
-snapshots). So the first time any Sounding command opens an older catalog, it renames
-it next to itself (for example `catalog.v1-20261105T082205.duckdb`), starts an empty
+This version uses catalog schema 3. A schema 2 catalog is upgraded in place the first
+time any Sounding command opens it: the new fields are added, existing snapshots show
+them as unknown until the next harvest, and nothing needs re-harvesting. The upgrade
+runs in one transaction, so a failure leaves the catalog as it was.
+
+Schema 1 catalogs (Sounding before 0.1.0) can't be converted reliably (timezone-less
+timestamps, alias-keyed snapshots). The first time Sounding opens one, it renames it
+next to itself (for example `catalog.v1-20261105T082205.duckdb`), starts an empty
 catalog at the same path, and prints a notice. Re-run `sounding harvest` for your
-datasets. Nothing is deleted, and no setting needs to change. A catalog from a *newer*
-Sounding is refused and left untouched.
+datasets. Nothing is deleted. A catalog from a *newer* Sounding is refused and left
+untouched.
 
 ### Search UI
 
@@ -93,7 +129,8 @@ uv run sounding ui --open      # http://127.0.0.1:8765, localhost only
 ```
 
 The page has live search over table names, column paths and descriptions, and reports which
-columns matched. Pick a table to see its size, freshness, full-scan cost, and nested schema.
+columns matched. Pick a table to see its size, freshness, full-scan cost, and nested schema,
+plus notes, labels, declared keys, storage, and which columns have policy tags.
 Each table page has three free actions:
 - **Column costs:** one dry run per column, drawn as bars.
 - **Preview:** 10 rows via `tabledata.list`.
@@ -116,7 +153,7 @@ discarded when the selection changes, and catalog text is escaped before display
 
 | Tool | Calls BigQuery? |
 | --- | --- |
-| `search_catalog`, `describe_table` | Never |
+| `search_catalog`, `describe_table`, `describe_dataset`, `search_routines`, `describe_routine` | Never |
 | `preview_rows`, `estimate_query_cost` | Yes, free calls only |
 
 `search_catalog(q="", limit=50, offset=0)` returns `{items, next_offset}`; pass
@@ -124,6 +161,8 @@ discarded when the selection changes, and catalog text is escaped before display
 per table; `matched_column_count` retains the full count. Search descriptions are
 excerpts; `describe_table` returns the full schema and descriptions. Paging reflects
 the latest catalog at each request, so a concurrent harvest can change page contents.
+`search_routines` pages the same way and returns 1000-character body excerpts;
+`describe_routine` returns the whole body, and `describe_dataset` lists signatures only.
 `preview_rows` accepts 1–50 rows and rejects views/external tables without querying
 them. Tool failures use MCP protocol errors, with credential and filesystem details
 removed. For estimates, agents must inspect `estimate_status`, `warnings`,
@@ -151,6 +190,7 @@ and the Python MCP SDK is the reference implementation.
 4. Join inference from column name, type and value overlap
 5. ✅ Search UI (`sounding ui`) with column costs, preview and a dry-run cost guard; next: an overview page
 6. Opt-in billed profiling behind a byte cap and approval, with results cached in the catalog
+7. ✅ Keep the whole table resource (keys, partition guidance, storage, labels, policy tags), dataset settings and routines; next: BigQuery ML models, row-access policy metadata, and opt-in job history
 
 ## Development
 
