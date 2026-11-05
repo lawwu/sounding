@@ -1,30 +1,27 @@
-"""The only module that calls BigQuery. Every call here is on a $0 rung:
+"""The only module that calls BigQuery: metadata, dry runs, and tabledata.list only.
 
-  tables.list / tables.get   REST metadata, API quota only
-  dry run                    bytes a query would scan; nothing executes
-  tabledata.list             preview rows (tables only, not views)
-
-Nothing here runs a billed query, and INFORMATION_SCHEMA is deliberately not used
-(it bills a 10 MB minimum per query and is never cached).
+No billed queries, Storage Read API, or INFORMATION_SCHEMA calls are used.
 """
 
 from __future__ import annotations
 
+import base64
 import datetime as dt
+import decimal
 import os
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
-import pyarrow as pa
 from google.cloud import bigquery
 
 from . import catalog
+from .errors import SoundingError, integer, text
 
-# Project that dry-run jobs are attributed to. Dry runs are not billed, but BigQuery
-# needs a project for them. Unset: the gcloud/ADC default project.
 JOB_PROJECT = os.environ.get("SOUNDING_JOB_PROJECT")
-# Parallel tables.get calls. Harvest is network-bound, so threads are enough.
 GET_TABLE_WORKERS = 16
+MAX_SQL_LENGTH = 100_000
+PRICE_BASIS = "US on-demand scan list price ($6.25/TiB); excludes free tier, discounts and other services."
 
 
 def client() -> bigquery.Client:
@@ -32,7 +29,7 @@ def client() -> bigquery.Client:
 
 
 def flatten(fields, prefix=""):
-    """Yield (path, field) for every field, descending into RECORDs: hits.page.pagePath."""
+    """Yield every field, including RECORD parents and nested/repeated children."""
     for f in fields:
         path = f"{prefix}{f.name}"
         yield path, f
@@ -48,11 +45,17 @@ def _partitioning(t) -> str | None:
     return None
 
 
-def harvest(datasets: list[str], con=None) -> None:
-    con = con or catalog.connect()
+def harvest(datasets: list[str]) -> None:
+    # Fail early on unsupported catalogs, but release the connection before network I/O.
+    with catalog.connect():
+        pass
     c = client()
-    for ds in datasets:
-        sid = con.execute("SELECT coalesce(max(snapshot_id), 0) + 1 FROM snapshots").fetchone()[0]
+    for raw_ds in datasets:
+        text(raw_ds, "dataset")
+        try:
+            ds = str(bigquery.DatasetReference.from_string(raw_ds, default_project=c.project))
+        except ValueError as error:
+            raise SoundingError("Dataset must be dataset or project.dataset.") from error
         refs = [i.reference for i in c.list_tables(ds)]
         with ThreadPoolExecutor(GET_TABLE_WORKERS) as pool:
             fetched = list(pool.map(c.get_table, refs))
@@ -60,55 +63,103 @@ def harvest(datasets: list[str], con=None) -> None:
         for t in fetched:
             fqn = f"{t.project}.{t.dataset_id}.{t.table_id}"
             table_rows.append({
-                "snapshot_id": sid, "dataset": ds, "table_id": t.table_id, "fqn": fqn,
+                "dataset": ds, "table_id": t.table_id, "fqn": fqn,
                 "type": t.table_type, "num_rows": t.num_rows, "num_bytes": t.num_bytes,
                 "created": t.created, "modified": t.modified, "partitioning": _partitioning(t),
                 "clustering": ",".join(t.clustering_fields) if t.clustering_fields else None,
                 "description": t.description, "view_sql": t.view_query})
-            # Some public tables have an empty schema; they contribute no columns.
-            col_rows += [{"snapshot_id": sid, "fqn": fqn, "path": p, "type": f.field_type,
+            col_rows += [{"fqn": fqn, "path": p, "type": f.field_type,
                           "mode": f.mode, "description": f.description} for p, f in flatten(t.schema)]
-        # Bulk inserts via Arrow. DuckDB executemany is row-at-a-time: it took 133 s
-        # for the 123k nested column paths of google_analytics_sample.
-        con.execute("BEGIN")
-        con.execute("INSERT INTO snapshots VALUES (?, ?, ?)", [sid, dt.datetime.now(dt.UTC), ds])
-        if table_rows:
-            tbatch = pa.Table.from_pylist(table_rows)  # noqa: F841 (read by DuckDB by name)
-            con.execute("INSERT INTO tables SELECT * FROM tbatch")
-        if col_rows:
-            cbatch = pa.Table.from_pylist(col_rows)  # noqa: F841
-            con.execute("INSERT INTO columns SELECT *, NULL::BIGINT FROM cbatch")
-        con.execute("COMMIT")
+        sid = catalog.save_snapshot(ds, table_rows, col_rows)
         print(f"{ds}: {len(fetched)} tables, {len(col_rows)} column paths (snapshot {sid})",
               file=sys.stderr)
 
 
 def dry_run(sql: str) -> dict:
+    text(sql, "sql", MAX_SQL_LENGTH)
+    # Deliberately conservative, including comments/literals: never submit INFORMATION_SCHEMA.
+    if re.search(r"\bINFORMATION_SCHEMA\b", sql, re.IGNORECASE):
+        raise SoundingError("INFORMATION_SCHEMA is not supported by Sounding.")
     job = client().query(sql, job_config=bigquery.QueryJobConfig(dry_run=True, use_query_cache=False))
-    b = job.total_bytes_processed or 0
-    return {"bytes": b, "usd_on_demand": catalog.usd(b),
-            "referenced_tables": [f"{r.project}.{r.dataset_id}.{r.table_id}" for r in job.referenced_tables],
-            "source": "dry run (free)"}
+    reported = job.total_bytes_processed
+    # The client has no public property for the REST accuracy field.
+    stats = job._properties.get("statistics", {}).get("query", {})
+    accuracy = stats.get("totalBytesProcessedAccuracy", "UNKNOWN")
+    refs = [f"{r.project}.{r.dataset_id}.{r.table_id}" for r in job.referenced_tables]
+    warnings = ["Dry-run estimates are not spending caps; data, pruning and runtime behavior can change costs."]
+    reliable = job.statement_type == "SELECT" and reported is not None and reported > 0
+    # Scripts, routines, external-service calls and incomplete byte estimates cannot be priced safely.
+    reliable = reliable and accuracy in ("PRECISE", "UPPER_BOUND")
+    reliable = reliable and not stats.get("referencedRoutines") and not stats.get("externalServiceCosts")
+    if not reliable:
+        warnings.append("Cost is unknown: scripts, dynamic SQL, routines, external data and row-level security may be unestimated; zero reported bytes does not mean free execution.")
+    complete_refs = job.statement_type == "SELECT" and len(refs) < 50
+    price = catalog.billing_range(reported, len(refs)) if reliable and complete_refs else None
+    if price and accuracy == "UPPER_BOUND":
+        price["min"] = None
+    if reliable and price is None:
+        warnings.append("A scan-price range is unavailable because the referenced-table list may be incomplete.")
+    if price and len(refs) > 1:
+        warnings.append("Price is a range: the dry run does not report each table's share of billable bytes.")
+    return {"bytes": reported if reliable else None, "reported_bytes": reported,
+            "estimate_status": ("upper_bound" if accuracy == "UPPER_BOUND" else "estimated") if reliable else "unknown",
+            "usd_on_demand": price["max"] if price and price["min"] == price["max"] else None,
+            "usd_on_demand_range": price, "price_basis": PRICE_BASIS,
+            "referenced_tables": refs, "referenced_tables_complete": complete_refs and reliable,
+            "warnings": warnings, "source": "dry run (free; never executes SQL)"}
 
 
-def column_costs(fqn: str, con=None) -> list[tuple[str, int]]:
-    """Dry-run `SELECT col FROM t` per top-level column and store the bytes in the catalog."""
-    con = con or catalog.connect()
-    sid = con.execute("SELECT max(snapshot_id) FROM columns WHERE fqn = ?", [fqn]).fetchone()[0]
-    if sid is None:
-        raise SystemExit(f"{fqn} not in catalog; harvest its dataset first")
-    cols = [r[0] for r in con.execute(
-        "SELECT path FROM columns WHERE snapshot_id = ? AND fqn = ? AND path NOT LIKE '%.%'",
-        [sid, fqn]).fetchall()]
-    out = []
-    for col in cols:
-        b = dry_run(f"SELECT `{col}` FROM `{fqn}`")["bytes"]
-        con.execute("UPDATE columns SET scan_bytes = ? WHERE snapshot_id = ? AND fqn = ? AND path = ?",
-                    [b, sid, fqn, col])
-        out.append((col, b))
+def quote_identifier(name: str) -> str:
+    """GoogleSQL quoted identifiers use backslash escapes, including for backticks."""
+    text(name, "identifier")
+    if any(ord(c) < 32 for c in name):
+        raise SoundingError("Identifiers must not contain control characters.")
+    return "`" + name.replace("\\", "\\\\").replace("`", "\\`") + "`"
+
+
+def column_costs(fqn: str) -> list[tuple[str, int | None]]:
+    """Compute outside the lock, then atomically cache only against the unchanged current snapshot."""
+    with catalog.connect() as con:
+        table = catalog.describe(con, fqn)
+    if table["type"] != "TABLE":
+        raise SoundingError("Column costs require a native table.")
+    cols = [c["path"] for c in table["columns"] if "." not in c["path"]]
+    out = [(col, dry_run(f"SELECT sounding_source.{quote_identifier(col)} FROM {quote_identifier(fqn)} AS sounding_source")["bytes"])
+           for col in cols]
+    with catalog.connect(write=True) as con:
+        if catalog.describe(con, fqn)["snapshot_id"] != table["snapshot_id"]:
+            raise SoundingError("The catalog changed while estimating columns. Retry against the new snapshot.")
+        con.execute("BEGIN")
+        try:
+            for col, size in out:
+                con.execute("UPDATE columns SET scan_bytes = ? WHERE snapshot_id = ? AND fqn = ? AND path = ?",
+                            [size, table["snapshot_id"], fqn, col])
+            con.execute("COMMIT")
+        except BaseException:
+            con.execute("ROLLBACK")
+            raise
     return out
 
 
+def _json_value(value):
+    if isinstance(value, dict):
+        return {k: _json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_value(v) for v in value]
+    if isinstance(value, (dt.date, dt.time)):
+        return value.isoformat()
+    if isinstance(value, decimal.Decimal):
+        return str(value)
+    if isinstance(value, bytes):
+        return base64.b64encode(value).decode("ascii")
+    return value
+
+
 def preview(fqn: str, n: int = 5) -> list[dict]:
-    rows = client().list_rows(fqn, max_results=n)
-    return [{k: (v.isoformat() if hasattr(v, "isoformat") else v) for k, v in r.items()} for r in rows]
+    text(fqn, "table")
+    integer(n, "n", 1, 50)
+    c = client()
+    table = c.get_table(fqn)
+    if table.table_type not in ("TABLE", "SNAPSHOT"):
+        raise SoundingError("Preview supports native tables and snapshots only, not views or external tables.")
+    return [_json_value(dict(row.items())) for row in c.list_rows(table, max_results=n)]

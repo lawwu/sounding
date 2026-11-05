@@ -2,7 +2,7 @@
 
 Sailors took a sounding to measure the water's depth before going in. Sounding does the same
 for BigQuery: it shows what data exists, how big and fresh it is, how tables are shaped, and
-what a query will cost, all without running a paid query.
+what a query may cost, all without running a paid query.
 
 It harvests metadata into a local DuckDB catalog using only BigQuery's free calls. People
 read the catalog from the CLI and agents read it over MCP.
@@ -16,13 +16,32 @@ Sounding answers each question from the cheapest source that can.
 | Local catalog | Everything already harvested, plus snapshot history | $0, no BigQuery call |
 | REST `tables.list` / `tables.get` | Schema (nested), descriptions, row and byte counts, last modified, partitioning, clustering, view SQL | $0 (API quota) |
 | `tabledata.list` | Sample rows (tables only, not views) | $0 |
-| Dry run | Bytes a query would scan, referenced tables | $0 |
-| INFORMATION_SCHEMA | Partitions, storage, job history | 10 MB minimum per query, never cached: **not used yet** |
+| Dry run | Estimated bytes, reported referenced tables, and estimate limitations | $0 |
+| INFORMATION_SCHEMA | Partitions, storage, job history | 10 MB minimum for on-demand queries; capacity queries consume slots; never cached: **rejected** |
 | Sampled profiles | `TABLESAMPLE` + `APPROX_*` | Billed: **not used yet** (planned as opt-in, capped, approved) |
 
 Two free tricks come from dry runs:
 - **Per-column cost:** a dry run of `SELECT col FROM t` gives the bytes that column scans.
 - **View lineage:** a dry run of a view lists the base tables it reads.
+
+Dry runs themselves are free; a zero-byte or incomplete dry run does **not** prove
+the eventual query would be free. Sounding reports unknown estimates as `null`,
+including scripts, dynamic SQL, zero/missing bytes, unknown/lower-bound estimates,
+and referenced routines. It never falls back to executing SQL. INFORMATION_SCHEMA
+is conservatively rejected even if its name appears in a comment or string literal.
+
+Prices cover scan costs at the **US on-demand list rate of $6.25/TiB**, before the
+monthly free tier and discounts; they do not cover other services or regional rates.
+They include MB rounding and the 10 MB minimum per referenced table. Multiple-table
+queries return a price range because dry runs do not expose per-table billable bytes;
+an upper-bound byte estimate produces only an upper price bound. If the table list
+may be incomplete, there is no price quote. Estimates are not spending caps.
+
+Google documents [free dry runs and their limitations](https://docs.cloud.google.com/bigquery/docs/running-queries#dry_run),
+[script dry-run limitations](https://docs.cloud.google.com/bigquery/docs/multi-statement-queries#dry-run_a_multi-statement_query),
+[free previews](https://docs.cloud.google.com/bigquery/docs/best-practices-costs#avoid_running_queries_to_explore_table_data),
+[the restriction on previewing logical views](https://docs.cloud.google.com/bigquery/docs/views-intro#logical_views_limitations),
+and [on-demand pricing](https://cloud.google.com/bigquery/pricing#on_demand_pricing).
 
 ## Use
 
@@ -41,6 +60,35 @@ uv run sounding preview bigquery-public-data.thelook_ecommerce.orders
 
 The catalog lives at `~/.sounding/catalog.duckdb`. Set `SOUNDING_CATALOG` to put it elsewhere.
 
+Each dataset publishes a complete snapshot in one transaction. A failed dataset
+crawl leaves its previous snapshot current; earlier datasets in the same command
+remain committed. Dataset aliases are normalized to `project.dataset`. Snapshot IDs
+are unique and allocated during the write transaction. Timestamps are stored as
+absolute instants and returned in UTC with an explicit offset.
+
+All Sounding processes coordinate short catalog operations through a `.lock`
+sidecar file. Harvests and column-cost calculations release the catalog before
+network calls, so UI and MCP reads can continue during those calls. Operations may
+wait up to 10 seconds for another local operation, then return a retryable error.
+Keep the catalog on a local filesystem; external DuckDB programs do not participate
+in this coordination and must close their connections before Sounding opens it.
+
+### Catalog upgrades
+
+This version uses catalog schema 2. Old catalogs are preserved and rejected with an
+actionable error: their timezone-less timestamps and potentially ambiguous snapshot
+identities cannot be reconstructed reliably. Reharvest into a new file, keeping the
+original for historical inspection:
+
+```bash
+export SOUNDING_CATALOG="$HOME/.sounding/catalog-v2.duckdb"
+uv run sounding harvest bigquery-public-data.thelook_ecommerce
+uv run sounding ui --open
+```
+
+Use the same `SOUNDING_CATALOG` setting for the CLI, UI, and MCP process. No automatic
+deletion or speculative conversion of old catalog data occurs.
+
 ### Search UI
 
 ```bash
@@ -56,6 +104,13 @@ Each table page has three free actions:
 
 Search and table pages never call BigQuery.
 
+The UI validates Host and Origin, rejects cross-site requests, and requires a random
+per-server token on API requests. All three BigQuery actions are JSON-only POSTs,
+including preview. Search pages contain at most 100 tables, with a bounded sample
+and total count of matched column paths; **Load more** retrieves the next page.
+Search treats `%`, `_`, and backslashes literally. Table responses and actions are
+discarded when the selection changes, and catalog text is escaped before display.
+
 ### Agents (MCP)
 
 ```json
@@ -66,6 +121,17 @@ Search and table pages never call BigQuery.
 | --- | --- |
 | `search_catalog`, `describe_table` | Never |
 | `preview_rows`, `estimate_query_cost` | Yes, free calls only |
+
+`search_catalog(q="", limit=50, offset=0)` returns `{items, next_offset}`; pass
+`next_offset` as `offset` to continue. Limits are 1–100 tables and 20 matching paths
+per table; `matched_column_count` retains the full count. Search descriptions are
+excerpts; `describe_table` returns the full schema and descriptions. Paging reflects
+the latest catalog at each request, so a concurrent harvest can change page contents.
+`preview_rows` accepts 1–50 rows and rejects views/external tables without querying
+them. Tool failures use MCP protocol errors, with credential and filesystem details
+removed. For estimates, agents must inspect `estimate_status`, `warnings`,
+`usd_on_demand_range`, and `referenced_tables_complete`, rather than interpreting
+unknown values as zero.
 
 ## What the first run showed (2026-11-04)
 
@@ -94,3 +160,9 @@ and the Python MCP SDK is the reference implementation.
 ```bash
 uv run pytest
 ```
+
+The suite is offline and fails on unmocked BigQuery calls. Install Node.js 22+ for
+the JavaScript security, pagination and stale-response tests (run by pytest;
+skipped with an explicit reason if Node is missing). CI installs Node and runs the
+full suite. Tests also cover process/thread locks, rollback, Arrow field mapping,
+legacy catalogs, UTC round trips, price minimums, HTTP security, and MCP over stdio.
