@@ -164,3 +164,45 @@ def test_lock_timeout_has_safe_error(seed, monkeypatch):
     with catalog.connect(), pytest.raises(CatalogBusy, match="Catalog is busy"):
         with catalog.connect():
             pass
+
+
+def _schema(path):
+    with duckdb.connect(str(path), read_only=True) as con:
+        return con.execute("""SELECT table_name, column_name, data_type FROM duckdb_columns() WHERE NOT internal AND schema_name = 'main'
+                              ORDER BY table_name, column_index""").fetchall()
+
+
+def test_v2_catalog_is_upgraded_in_place(tmp_path, capsys):
+    path = tmp_path / "v2.duckdb"
+    with duckdb.connect(str(path)) as con:
+        con.execute(catalog.SCHEMA_V2)
+        con.execute("INSERT INTO snapshots VALUES (1, '2026-01-01 00:00:00+00', 'p.d')")
+        con.execute("""INSERT INTO tables (snapshot_id, dataset, table_id, fqn, type, num_rows, num_bytes)
+                       VALUES (1, 'p.d', 't', 'p.d.t', 'TABLE', 5, 100)""")
+        con.execute("INSERT INTO columns (snapshot_id, fqn, path, type, mode) VALUES (1, 'p.d.t', 'id', 'INT64', 'NULLABLE')")
+    with catalog.connect(path) as con:
+        t = catalog.describe(con, "p.d.t")
+        d = catalog.describe_dataset(con, "p.d")
+        assert catalog.stats(con) | {"harvested_at": None} == {
+            "datasets": 1, "tables": 1, "bytes": 100, "harvested_at": None, "routines": 0}
+    assert "upgraded the catalog to schema 3" in capsys.readouterr().err
+    assert list(tmp_path.glob("v2.v*")) == []  # upgraded, not moved aside
+    assert t["num_rows"] == 5 and t["columns"][0]["path"] == "id"
+    assert t["storage"] is None and t["labels"] is None and t["columns"][0]["policy_tags"] is None
+    assert d["routines_status"] is None and d["tables"] == 1  # harvested before routines existed
+    fresh = tmp_path / "fresh.duckdb"
+    with catalog.connect(fresh):
+        pass
+    assert _schema(path) == _schema(fresh)
+
+
+def test_failed_migration_leaves_v2_catalog_intact(tmp_path, monkeypatch):
+    path = tmp_path / "v2.duckdb"
+    with duckdb.connect(str(path)) as con:
+        con.execute(catalog.SCHEMA_V2)
+    before = _schema(path)
+    monkeypatch.setitem(catalog.MIGRATIONS, 2, catalog.MIGRATIONS[2] + "\nSELECT no_such_function();")
+    with pytest.raises(duckdb.Error):
+        with catalog.connect(path):
+            pass
+    assert _schema(path) == before

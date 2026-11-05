@@ -42,12 +42,40 @@ def create_server() -> MCPServer:
             return catalog.search(con, q, limit, offset)
 
     @app.tool(description="Schema, size, UTC freshness, partitioning and clustering for "
-              "project.dataset.table in the latest snapshot. Local only; never calls BigQuery. "
-              "Unknown full-scan prices are null.")
+              "project.dataset.table in the latest snapshot, plus declared (unenforced) keys, "
+              "partition-filter requirements, storage bytes, labels, column policy tags, expiry, "
+              "snapshot/clone source and external or materialized-view settings. Read `notes` "
+              "before writing a query. Local only; never calls BigQuery. Missing values are null "
+              "(unknown), never zero.")
     @tool_errors
     def describe_table(table: Annotated[str, Field(min_length=1, max_length=2048)]) -> dict:
         with catalog.connect() as con:
             return catalog.describe(con, table)
+
+    @app.tool(description="Dataset location, description, labels, default expirations and storage "
+              "billing model, with its tables count and routine signatures (no bodies). Local only; "
+              "never calls BigQuery. routines_status is 'denied' when routines could not be listed.")
+    @tool_errors
+    def describe_dataset(dataset: Annotated[str, Field(min_length=1, max_length=2048)]) -> dict:
+        with catalog.connect() as con:
+            return catalog.describe_dataset(con, dataset)
+
+    @app.tool(description="Literal substring search of harvested functions and procedures by name, "
+              "description or body. Local only; never calls BigQuery. Bodies are 1000-character "
+              "excerpts; use describe_routine for the whole definition.")
+    @tool_errors
+    def search_routines(q: Annotated[str, Field(max_length=2048)] = "",
+                        limit: Annotated[int, Field(ge=1, le=100)] = 50,
+                        offset: Annotated[int, Field(ge=0, le=1_000_000)] = 0) -> dict:
+        with catalog.connect() as con:
+            return catalog.search_routines(con, q, limit, offset)
+
+    @app.tool(description="One function or procedure (project.dataset.routine): type, language, "
+              "signature, return type, description and full definition. Local only.")
+    @tool_errors
+    def describe_routine(routine: Annotated[str, Field(min_length=1, max_length=2048)]) -> dict:
+        with catalog.connect() as con:
+            return catalog.describe_routine(con, routine)
 
     @app.tool(description="1–50 sample rows via free tables.get and tabledata.list calls. "
               "Native tables and snapshots only; views/external tables are rejected, never queried. "

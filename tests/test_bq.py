@@ -1,10 +1,12 @@
 import datetime as dt
+import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace as NS
 from unittest.mock import Mock
 
 import pytest
+from google.api_core.exceptions import Forbidden
 from google.cloud import bigquery
 
 from sounding import bq, catalog
@@ -12,23 +14,38 @@ from sounding.errors import MissingTable, SoundingError
 from conftest import column_row, table_row
 
 
-def field(name, kind="STRING", fields=(), mode="NULLABLE"):
-    return NS(name=name, field_type=kind, fields=fields, mode=mode, description=None)
+def field(name, kind="STRING", fields=(), mode="NULLABLE", **extra):
+    f = {"name": name, "type": kind, "mode": mode} | extra
+    if fields:
+        f["fields"] = list(fields)
+    return f
 
 
-def remote_table(name="t", schema=None):
-    return NS(project="p", dataset_id="d", table_id=name, table_type="TABLE", num_rows=10,
-              num_bytes=100, created=dt.datetime(2026, 1, 1, tzinfo=dt.UTC),
-              modified=dt.datetime(2026, 1, 2, tzinfo=dt.UTC), time_partitioning=None,
-              range_partitioning=None, clustering_fields=None, description=None, view_query=None,
-              schema=[field("id")] if schema is None else schema)
+def remote_table(name="t", schema=None, **resource):
+    """A tables.get response, built the way google-cloud-bigquery builds one."""
+    return bigquery.Table.from_api_repr({
+        "tableReference": {"projectId": "p", "datasetId": "d", "tableId": name}, "type": "TABLE",
+        "numRows": "10", "numBytes": "100", "creationTime": "1767225600000", "lastModifiedTime": "1767312000000",
+        "schema": {"fields": [field("id")] if schema is None else schema}} | resource)
 
 
-def fake_client(monkeypatch, tables=None):
+def remote_routine(name="f", **resource):
+    return bigquery.Routine.from_api_repr({
+        "routineReference": {"projectId": "p", "datasetId": "d", "routineId": name},
+        "routineType": "SCALAR_FUNCTION", "language": "SQL", "definitionBody": "x + 1",
+        "arguments": [{"name": "x", "dataType": {"typeKind": "INT64"}}],
+        "returnType": {"typeKind": "INT64"}} | resource)
+
+
+def fake_client(monkeypatch, tables=None, routines=(), dataset=None):
     tables = [remote_table()] if tables is None else tables
     client = Mock(project="p")
+    client.get_dataset.return_value = bigquery.Dataset.from_api_repr(
+        {"datasetReference": {"projectId": "p", "datasetId": "d"}, "location": "US"} | (dataset or {}))
     client.list_tables.return_value = [NS(reference=t) for t in tables]
     client.get_table.side_effect = lambda ref: ref
+    client.list_routines.return_value = [NS(reference=r) for r in routines]
+    client.get_routine.side_effect = lambda ref: ref
     monkeypatch.setattr(bq, "client", lambda: client)
     return client
 
@@ -218,6 +235,119 @@ def test_preview_never_falls_back_to_query(monkeypatch):
     assert bq.preview("p.d.t",5)==[{"nested":{"when":"2026-01-01T00:00:00+00:00","bytes":"/w=="}}]
     c.list_rows.assert_called_once_with(c.get_table.return_value,max_results=5)
     for kind in ["VIEW","EXTERNAL","MATERIALIZED_VIEW"]:
-        c.get_table.return_value.table_type=kind
+        c.get_table.return_value=remote_table(type=kind)
         with pytest.raises(SoundingError): bq.preview("p.d.t")
     c.query.assert_not_called()
+
+
+def test_table_resource_fields_are_captured(monkeypatch):
+    schema = [field("id", "INT64"), field("email", policyTags={"names": ["projects/p/locations/us/taxonomies/1/policyTags/2"]})]
+    full = remote_table("orders", schema, location="US", requirePartitionFilter=True, numPartitions="32",
+        timePartitioning={"type": "DAY", "field": "day", "expirationMs": "86400000"},
+        clustering={"fields": ["id"]}, labels={"team": "data"}, expirationTime="1798761600000",
+        numActiveLogicalBytes="70", numLongTermLogicalBytes="30", numTotalPhysicalBytes="12",
+        encryptionConfiguration={"kmsKeyName": "projects/p/keys/k"},
+        snapshotDefinition={"baseTableReference": {"projectId": "p", "datasetId": "d", "tableId": "base"}, "snapshotTime": "2026-01-01T00:00:00Z"},
+        tableConstraints={"primaryKey": {"columns": ["id"]}, "foreignKeys": [{"name": "fk_user",
+            "referencedTable": {"projectId": "p", "datasetId": "d", "tableId": "users"},
+            "columnReferences": [{"referencingColumn": "user_id", "referencedColumn": "id"}]}]})
+    bare = remote_table("plain")
+    fake_client(monkeypatch, [full, bare])
+    bq.harvest(["d"])
+    with catalog.connect() as con:
+        t = catalog.describe(con, "p.d.orders")
+        plain = catalog.describe(con, "p.d.plain")
+        resource = json.loads(con.execute("SELECT resource FROM tables WHERE fqn = 'p.d.orders'").fetchone()[0])
+    assert t["partitioning"] == "DAY:day" and t["require_partition_filter"] is True
+    assert t["partition_expiration_ms"] == 86_400_000 and t["num_partitions"] == 32
+    assert t["primary_key"] == ["id"]
+    assert t["foreign_keys"] == [{"name": "fk_user", "references": "p.d.users", "columns": [["user_id", "id"]]}]
+    assert t["storage"] == {"active_logical": 70, "long_term_logical": 30, "total_physical": 12}
+    assert t["labels"] == {"team": "data"} and t["location"] == "US"
+    assert t["expires"] == "2027-01-01T00:00:00+00:00" and t["kms_key"] == "projects/p/keys/k"
+    assert (t["base_kind"], t["base_table"]) == ("SNAPSHOT", "p.d.base")
+    assert [c["policy_tags"] for c in t["columns"]] == [None, ["projects/p/locations/us/taxonomies/1/policyTags/2"]]
+    assert any("must filter on the partition column" in n for n in t["notes"])
+    assert any("policy tags" in n and "email" in n for n in t["notes"])
+    assert any("not enforced" in n for n in t["notes"])
+    assert "resource" not in t and "schema" not in resource and resource["numPartitions"] == "32"
+    # Absent fields are unknown (None), never zero or False.
+    assert plain["storage"] is None and plain["num_partitions"] is None
+    assert plain["require_partition_filter"] is None and plain["primary_key"] is None and plain["notes"] == []
+
+
+def test_partitioned_table_without_flag_does_not_require_filter(monkeypatch):
+    fake_client(monkeypatch, [remote_table(timePartitioning={"type": "DAY"})])
+    bq.harvest(["d"])
+    with catalog.connect() as con:
+        t = catalog.describe(con, "p.d.t")
+    assert t["partitioning"] == "DAY:_PARTITIONTIME" and t["require_partition_filter"] is False
+
+
+def test_views_materialized_views_and_external_tables(monkeypatch):
+    fake_client(monkeypatch, [
+        remote_table("v", type="VIEW", view={"query": "SELECT 1"}),
+        remote_table("mv", type="MATERIALIZED_VIEW", materializedView={"query": "SELECT 2", "enableRefresh": True},
+                     materializedViewStatus={"refreshWatermark": "2026-01-01T00:00:00Z"}),
+        remote_table("ext", type="EXTERNAL", externalDataConfiguration={"sourceFormat": "PARQUET", "sourceUris": ["gs://b/*"]})])
+    bq.harvest(["d"])
+    with catalog.connect() as con:
+        v, mv, ext = (catalog.describe(con, f"p.d.{n}") for n in ("v", "mv", "ext"))
+    assert v["view_sql"] == "SELECT 1" and mv["view_sql"] == "SELECT 2"
+    assert mv["materialized_view"] == {"enableRefresh": True, "status": {"refreshWatermark": "2026-01-01T00:00:00Z"}}
+    assert ext["external"]["sourceFormat"] == "PARQUET"
+    assert any("External table" in n for n in ext["notes"])
+
+
+def test_dataset_metadata_never_stores_access_entries(monkeypatch):
+    fake_client(monkeypatch, dataset={"description": "Orders", "labels": {"env": "prod"},
+        "defaultTableExpirationMs": "3600000", "storageBillingModel": "PHYSICAL", "maxTimeTravelHours": "168",
+        "access": [{"role": "READER", "userByEmail": "someone@example.com"}]})
+    bq.harvest(["d"])
+    with catalog.connect() as con:
+        d = catalog.describe_dataset(con, "p.d")
+    assert d["location"] == "US" and d["description"] == "Orders" and d["labels"] == {"env": "prod"}
+    assert d["default_table_expiration_ms"] == 3_600_000 and d["storage_billing_model"] == "PHYSICAL"
+    assert d["max_time_travel_hours"] == 168 and d["tables"] == 1 and d["routines_status"] == "harvested"
+    assert b"someone@example.com" not in catalog.CATALOG.read_bytes()
+
+
+def test_routines_are_harvested_and_searchable(monkeypatch):
+    big = "SELECT " + "x, " * 600
+    fake_client(monkeypatch, routines=[
+        remote_routine("add_one", description="Adds one"),
+        remote_routine("tags", arguments=[{"name": "s", "dataType": {"typeKind": "STRING"}},
+                                         {"name": "v", "argumentKind": "ANY_TYPE"}],
+                       returnType={"typeKind": "ARRAY", "arrayElementType": {"typeKind": "STRUCT", "structType":
+                                   {"fields": [{"name": "k", "type": {"typeKind": "STRING"}}]}}}),
+        remote_routine("rows", routineType="TABLE_VALUED_FUNCTION", returnType=None, definitionBody=big,
+                       returnTableType={"columns": [{"name": "n", "type": {"typeKind": "INT64"}}]})])
+    bq.harvest(["d"])
+    with catalog.connect() as con:
+        d = catalog.describe_dataset(con, "p.d")
+        found = catalog.search_routines(con, "adds")
+        page = catalog.search_routines(con, limit=2)
+        rows = catalog.describe_routine(con, "p.d.rows")
+        listed = catalog.search_routines(con, "rows")["items"][0]
+        assert catalog.stats(con)["routines"] == 3
+        with pytest.raises(MissingTable):
+            catalog.describe_routine(con, "p.d.missing")
+    by_name = {r["routine"]: r for r in d["routines"]}
+    assert by_name["p.d.add_one"]["signature"] == "(x INT64)" and by_name["p.d.add_one"]["returns"] == "INT64"
+    assert by_name["p.d.tags"]["signature"] == "(s STRING, v ANY TYPE)"
+    assert by_name["p.d.tags"]["returns"] == "ARRAY<STRUCT<k STRING>>"
+    assert by_name["p.d.rows"]["returns"] == "TABLE<n INT64>"
+    assert all("definition" not in r for r in d["routines"])
+    assert [r["routine"] for r in found["items"]] == ["p.d.add_one"]
+    assert len(page["items"]) == 2 and page["next_offset"] == 2
+    assert rows["definition"] == big and len(listed["definition"]) == 1000
+
+
+def test_denied_routines_keep_tables(monkeypatch):
+    c = fake_client(monkeypatch)
+    c.list_routines.side_effect = Forbidden("no routines.list")
+    bq.harvest(["d"])
+    with catalog.connect() as con:
+        assert catalog.describe(con, "p.d.t")["fqn"] == "p.d.t"
+        d = catalog.describe_dataset(con, "p.d")
+    assert d["routines_status"] == "denied" and d["routines"] == []

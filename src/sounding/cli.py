@@ -3,6 +3,9 @@
   sounding harvest bigquery-public-data.thelook_ecommerce [more datasets...]
   sounding show [text]                 # catalog only, no BigQuery call
   sounding describe <project.dataset.table>
+  sounding dataset <project.dataset>   # dataset settings and its routines
+  sounding routines [text]             # search functions and procedures
+  sounding routine <project.dataset.routine>
   sounding column-costs <project.dataset.table>   # one free dry run per column
   sounding estimate "<sql>"            # free dry run
   sounding preview <project.dataset.table>        # free tabledata.list
@@ -23,6 +26,9 @@ def _main() -> None:
     sub.add_parser("harvest", help="crawl datasets into the catalog (free calls only)").add_argument("datasets", nargs="+")
     sub.add_parser("show", help="list or search catalog tables").add_argument("q", nargs="?", default="")
     sub.add_parser("describe", help="one table from the catalog").add_argument("table")
+    sub.add_parser("dataset", help="one dataset and its routines from the catalog").add_argument("dataset")
+    sub.add_parser("routines", help="search harvested functions and procedures").add_argument("q", nargs="?", default="")
+    sub.add_parser("routine", help="one function or procedure, with its definition").add_argument("routine")
     sub.add_parser("column-costs", help="per-column scan bytes via dry runs").add_argument("table")
     sub.add_parser("estimate", help="dry-run a query").add_argument("sql")
     sub.add_parser("preview", help="sample rows via tabledata.list").add_argument("table")
@@ -54,6 +60,21 @@ def _main() -> None:
         with catalog.connect() as con:
             result = catalog.describe(con, a.table)
         print(json.dumps(result, indent=2))
+    elif a.cmd == "dataset":
+        with catalog.connect() as con:
+            print(json.dumps(catalog.describe_dataset(con, a.dataset), indent=2))
+    elif a.cmd == "routines":
+        offset = 0
+        while offset is not None:
+            with catalog.connect() as con:
+                page = catalog.search_routines(con, a.q, offset=offset)
+            for r in page["items"]:
+                returns = f" -> {r['returns']}" if r["returns"] else ""
+                print(f"{r['type'] or '':<22} {r['routine']}{r['signature']}{returns}")
+            offset = page["next_offset"]
+    elif a.cmd == "routine":
+        with catalog.connect() as con:
+            print(json.dumps(catalog.describe_routine(con, a.routine), indent=2))
     elif a.cmd == "column-costs":
         for col, b in sorted(bq.column_costs(a.table), key=lambda x: -(x[1] or 0)):
             size = "unknown" if b is None else f"{b / 1e6:.2f} MB"

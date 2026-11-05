@@ -7,6 +7,7 @@ and never held across network calls. Readers open DuckDB read-only after initial
 from __future__ import annotations
 
 import datetime as dt
+import json
 import os
 import sys
 from contextlib import contextmanager
@@ -20,14 +21,16 @@ from .errors import CatalogBusy, CatalogVersionError, MissingTable, integer, tex
 
 CATALOG = Path(os.environ.get("SOUNDING_CATALOG", Path.home() / ".sounding" / "catalog.duckdb"))
 LOCK_TIMEOUT = 10
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 USD_PER_TIB = 6.25  # US on-demand list price; excludes discounts and the monthly free tier.
 TIB = 1024**4
 MIB = 1024**2
 SEARCH_LIMIT = 100
 MATCH_LIMIT = 20
 
-SCHEMA = """
+# Schema 2 as first released. Later versions are applied on top by MIGRATIONS, so a new
+# catalog and an upgraded one end up identical.
+SCHEMA_V2 = """
 CREATE TABLE catalog_meta (version INTEGER);
 INSERT INTO catalog_meta VALUES (2);
 CREATE TABLE snapshots (
@@ -42,23 +45,79 @@ CREATE TABLE columns (
   description VARCHAR, scan_bytes BIGINT, PRIMARY KEY (snapshot_id, fqn, path));
 """
 
+# Additive only: snapshots harvested before an upgrade keep NULL (unknown) in new fields.
+MIGRATIONS = {
+    2: """
+ALTER TABLE tables ADD COLUMN location VARCHAR;
+ALTER TABLE tables ADD COLUMN expires TIMESTAMPTZ;
+ALTER TABLE tables ADD COLUMN labels JSON;
+ALTER TABLE tables ADD COLUMN require_partition_filter BOOLEAN;
+ALTER TABLE tables ADD COLUMN partition_expiration_ms BIGINT;
+ALTER TABLE tables ADD COLUMN num_partitions BIGINT;
+ALTER TABLE tables ADD COLUMN primary_key VARCHAR[];
+ALTER TABLE tables ADD COLUMN foreign_keys JSON;
+ALTER TABLE tables ADD COLUMN storage JSON;
+ALTER TABLE tables ADD COLUMN kms_key VARCHAR;
+ALTER TABLE tables ADD COLUMN base_table VARCHAR;
+ALTER TABLE tables ADD COLUMN base_kind VARCHAR;
+ALTER TABLE tables ADD COLUMN external JSON;
+ALTER TABLE tables ADD COLUMN materialized_view JSON;
+ALTER TABLE tables ADD COLUMN resource JSON;
+ALTER TABLE columns ADD COLUMN policy_tags VARCHAR[];
+CREATE TABLE datasets (
+  snapshot_id BIGINT PRIMARY KEY, dataset VARCHAR, location VARCHAR, friendly_name VARCHAR,
+  description VARCHAR, labels JSON, created TIMESTAMPTZ, modified TIMESTAMPTZ,
+  default_table_expiration_ms BIGINT, default_partition_expiration_ms BIGINT,
+  storage_billing_model VARCHAR, max_time_travel_hours BIGINT, routines_status VARCHAR,
+  resource JSON);
+CREATE TABLE routines (
+  snapshot_id BIGINT, dataset VARCHAR, routine_id VARCHAR, fqn VARCHAR, type VARCHAR,
+  language VARCHAR, arguments JSON, return_type VARCHAR, description VARCHAR,
+  definition VARCHAR, created TIMESTAMPTZ, modified TIMESTAMPTZ, resource JSON,
+  PRIMARY KEY (snapshot_id, fqn));
+UPDATE catalog_meta SET version = 3;
+""",
+}
+JSON_FIELDS = {"labels", "foreign_keys", "storage", "external", "materialized_view", "resource", "arguments"}
+
 LATEST = """WITH latest AS (
     SELECT dataset, max(snapshot_id) AS snapshot_id FROM snapshots GROUP BY dataset
 ), current_tables AS (
     SELECT t.* FROM tables t JOIN latest l USING (dataset, snapshot_id)
 )"""
 
+_TS = pa.timestamp("us", tz="UTC")
+_LIST = pa.list_(pa.string())
+# JSON columns travel as strings; DuckDB casts them on insert.
 TABLE_SCHEMA = pa.schema([
     ("snapshot_id", pa.int64()), ("dataset", pa.string()), ("table_id", pa.string()),
     ("fqn", pa.string()), ("type", pa.string()), ("num_rows", pa.int64()),
-    ("num_bytes", pa.int64()), ("created", pa.timestamp("us", tz="UTC")),
-    ("modified", pa.timestamp("us", tz="UTC")), ("partitioning", pa.string()),
+    ("num_bytes", pa.int64()), ("created", _TS), ("modified", _TS), ("partitioning", pa.string()),
     ("clustering", pa.string()), ("description", pa.string()), ("view_sql", pa.string()),
+    ("location", pa.string()), ("expires", _TS), ("labels", pa.string()),
+    ("require_partition_filter", pa.bool_()), ("partition_expiration_ms", pa.int64()),
+    ("num_partitions", pa.int64()), ("primary_key", _LIST), ("foreign_keys", pa.string()),
+    ("storage", pa.string()), ("kms_key", pa.string()), ("base_table", pa.string()),
+    ("base_kind", pa.string()), ("external", pa.string()), ("materialized_view", pa.string()),
+    ("resource", pa.string()),
 ])
 COLUMN_SCHEMA = pa.schema([
     ("snapshot_id", pa.int64()), ("fqn", pa.string()), ("path", pa.string()),
     ("type", pa.string()), ("mode", pa.string()), ("description", pa.string()),
-    ("scan_bytes", pa.int64()),
+    ("scan_bytes", pa.int64()), ("policy_tags", _LIST),
+])
+DATASET_SCHEMA = pa.schema([
+    ("snapshot_id", pa.int64()), ("dataset", pa.string()), ("location", pa.string()),
+    ("friendly_name", pa.string()), ("description", pa.string()), ("labels", pa.string()),
+    ("created", _TS), ("modified", _TS), ("default_table_expiration_ms", pa.int64()),
+    ("default_partition_expiration_ms", pa.int64()), ("storage_billing_model", pa.string()),
+    ("max_time_travel_hours", pa.int64()), ("routines_status", pa.string()), ("resource", pa.string()),
+])
+ROUTINE_SCHEMA = pa.schema([
+    ("snapshot_id", pa.int64()), ("dataset", pa.string()), ("routine_id", pa.string()),
+    ("fqn", pa.string()), ("type", pa.string()), ("language", pa.string()),
+    ("arguments", pa.string()), ("return_type", pa.string()), ("description", pa.string()),
+    ("definition", pa.string()), ("created", _TS), ("modified", _TS), ("resource", pa.string()),
 ])
 
 
@@ -93,6 +152,22 @@ def _set_aside(path: Path, version: int | None) -> Path:
     return target
 
 
+def _migrate(path: Path, version: int) -> None:
+    """Apply additive migrations in place, in one transaction per step."""
+    with _open(path, write=True) as con:
+        while version < SCHEMA_VERSION:
+            con.execute("BEGIN")
+            try:
+                con.execute(MIGRATIONS[version])
+                con.execute("COMMIT")
+            except BaseException:
+                con.execute("ROLLBACK")
+                raise
+            version = _version(con)
+    print(f"sounding: upgraded the catalog to schema {SCHEMA_VERSION}. Older snapshots show new "
+          "fields as unknown until you harvest again.", file=sys.stderr)
+
+
 def _open(path: Path, write: bool):
     try:
         return duckdb.connect(str(path), read_only=not write)
@@ -104,8 +179,9 @@ def _open(path: Path, write: bool):
 def connect(path: Path | str | None = None, *, write: bool = False):
     """Acquire the process/thread lock before opening DuckDB; always close before unlocking.
 
-    An older-schema catalog is moved aside (see _set_aside) and replaced by an empty one.
-    A newer-schema catalog is left untouched and refused.
+    A schema-2 catalog is upgraded in place (see MIGRATIONS). A schema-1 catalog can't be
+    converted, so it is moved aside (see _set_aside) and replaced by an empty one. A
+    newer-schema catalog is left untouched and refused.
     """
     path = Path(path or CATALOG).expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -119,11 +195,15 @@ def connect(path: Path | str | None = None, *, write: bool = False):
                         f"This catalog uses schema {version}, newer than this Sounding supports "
                         f"({SCHEMA_VERSION}). Upgrade Sounding, or set SOUNDING_CATALOG to another file. "
                         "No data was changed.")
-                if version != SCHEMA_VERSION:
+                if version in MIGRATIONS:
+                    _migrate(path, version)
+                elif version != SCHEMA_VERSION:
                     _set_aside(path, version)
             if not path.exists():
                 with duckdb.connect(str(path)) as initial:
-                    initial.execute(SCHEMA)
+                    initial.execute(SCHEMA_V2)
+                    for step in range(2, SCHEMA_VERSION):
+                        initial.execute(MIGRATIONS[step])
             _VERIFIED.add(path)
             con = _open(path, write)
             try:
@@ -135,16 +215,20 @@ def connect(path: Path | str | None = None, *, write: bool = False):
         raise CatalogBusy("Catalog is busy. Retry after the current local operation finishes.") from error
 
 
-def save_snapshot(dataset: str, table_rows: list[dict], col_rows: list[dict]) -> int:
+def save_snapshot(dataset: str, table_rows: list[dict], col_rows: list[dict],
+                  dataset_row: dict | None = None, routine_rows: list[dict] = ()) -> int:
     """Publish one complete dataset atomically. Failed inserts leave the previous snapshot current."""
+    batches = [("tables", table_rows, TABLE_SCHEMA), ("columns", col_rows, COLUMN_SCHEMA),
+               ("datasets", [dataset_row] if dataset_row else [], DATASET_SCHEMA),
+               ("routines", list(routine_rows), ROUTINE_SCHEMA)]
     with connect(write=True) as con:
         con.execute("BEGIN")
         try:
             sid = con.execute("SELECT coalesce(max(snapshot_id), 0) + 1 FROM snapshots").fetchone()[0]
             con.execute("INSERT INTO snapshots VALUES (?, ?, ?)", [sid, dt.datetime.now(dt.UTC), dataset])
-            for name, rows, schema in [("tables", table_rows, TABLE_SCHEMA), ("columns", col_rows, COLUMN_SCHEMA)]:
+            for name, rows, schema in batches:
                 if rows:
-                    batch = pa.Table.from_pylist([dict(row, snapshot_id=sid) for row in rows], schema=schema)
+                    batch = pa.Table.from_pylist([_encode(dict(row, snapshot_id=sid)) for row in rows], schema=schema)
                     con.register("batch", batch)
                     # Explicit Arrow fields and BY NAME avoid depending on dict/DDL column ordering.
                     con.execute(f"INSERT INTO {name} BY NAME SELECT * FROM batch")
@@ -154,6 +238,17 @@ def save_snapshot(dataset: str, table_rows: list[dict], col_rows: list[dict]) ->
             con.execute("ROLLBACK")
             raise
     return sid
+
+
+def _encode(row: dict) -> dict:
+    return {k: json.dumps(v, sort_keys=True) if k in JSON_FIELDS and v is not None else v
+            for k, v in row.items()}
+
+
+def _decode(key: str, value):
+    if key in JSON_FIELDS and isinstance(value, str):
+        return json.loads(value)
+    return _iso(value)
 
 
 def usd(num_bytes: int | None) -> float | None:
@@ -220,23 +315,108 @@ def search(con, q: str = "", limit: int = 50, offset: int = 0) -> dict:
 def stats(con) -> dict:
     r = con.execute(LATEST + """
         SELECT (SELECT count(*) FROM latest), count(*), coalesce(sum(num_bytes), 0),
-               (SELECT max(taken_at) FROM snapshots JOIN latest USING (dataset, snapshot_id))
+               (SELECT max(taken_at) FROM snapshots JOIN latest USING (dataset, snapshot_id)),
+               (SELECT count(*) FROM routines JOIN latest USING (dataset, snapshot_id))
         FROM current_tables
     """).fetchone()
-    return {"datasets": r[0], "tables": r[1], "bytes": r[2], "harvested_at": _iso(r[3])}
+    return {"datasets": r[0], "tables": r[1], "bytes": r[2], "harvested_at": _iso(r[3]), "routines": r[4]}
+
+
+def _notes(t: dict, columns: list[dict]) -> list[str]:
+    """Plain-language hints a person or agent should know before querying this table."""
+    notes = []
+    if t.get("require_partition_filter"):
+        notes.append(f"Queries must filter on the partition column ({t['partitioning']}); BigQuery rejects them otherwise.")
+    tagged = [c["path"] for c in columns if c.get("policy_tags")]
+    if tagged:
+        notes.append(f"{len(tagged)} column(s) have policy tags; reading them may be denied: {', '.join(tagged[:5])}"
+                     + (" …" if len(tagged) > 5 else ""))
+    if t.get("primary_key") or t.get("foreign_keys"):
+        notes.append("Declared keys are not enforced by BigQuery; treat them as join hints, not guarantees.")
+    if t.get("type") == "EXTERNAL":
+        notes.append("External table: dry runs cannot price reads from the external source.")
+    if t.get("expires"):
+        notes.append(f"Table expires (is deleted) at {t['expires']}.")
+    if t.get("base_table"):
+        notes.append(f"{t['base_kind'].title()} of {t['base_table']}.")
+    return notes
 
 
 def describe(con, fqn: str) -> dict:
     text(fqn, "table")
-    cur = con.execute(LATEST + " SELECT * FROM current_tables WHERE fqn = ?", [fqn])
+    cur = con.execute(LATEST + " SELECT * EXCLUDE (resource) FROM current_tables WHERE fqn = ?", [fqn])
     row = cur.fetchone()
     if row is None:
         raise MissingTable("Table is not in the latest catalog snapshot; harvest its dataset first.")
-    out = {k: _iso(v) for k, v in zip([d[0] for d in cur.description], row)}
+    out = {k: _decode(k, v) for k, v in zip([d[0] for d in cur.description], row)}
+    names = ["path", "type", "mode", "description", "scan_bytes", "policy_tags"]
     cols = con.execute(
-        "SELECT path, type, mode, description, scan_bytes FROM columns WHERE snapshot_id = ? AND fqn = ? ORDER BY rowid",
+        f"SELECT {', '.join(names)} FROM columns WHERE snapshot_id = ? AND fqn = ? ORDER BY rowid",
         [out["snapshot_id"], fqn]).fetchall()
-    out["columns"] = [dict(zip(["path", "type", "mode", "description", "scan_bytes"], c)) for c in cols]
+    out["columns"] = [dict(zip(names, c)) for c in cols]
     out["full_scan_usd"] = full_scan_usd(out["type"], out["num_bytes"])
+    out["notes"] = _notes(out, out["columns"])
     out["source"] = "catalog (tables.get, free)"
     return out
+
+
+def describe_dataset(con, dataset: str) -> dict:
+    """Dataset settings plus its routines, from the latest snapshot."""
+    text(dataset, "dataset")
+    snap = con.execute(LATEST + " SELECT snapshot_id FROM latest WHERE dataset = ?", [dataset]).fetchone()
+    if snap is None:
+        raise MissingTable("Dataset is not in the catalog; harvest it first.")
+    cur = con.execute("SELECT * EXCLUDE (resource, snapshot_id) FROM datasets WHERE snapshot_id = ?", [snap[0]])
+    row = cur.fetchone()
+    out = ({k: _decode(k, v) for k, v in zip([d[0] for d in cur.description], row)} if row
+           else {"dataset": dataset, "routines_status": None})  # harvested before schema 3
+    out["snapshot_id"] = snap[0]
+    out["tables"] = con.execute("SELECT count(*) FROM tables WHERE snapshot_id = ?", [snap[0]]).fetchone()[0]
+    out["routines"] = [_routine(r, definition_chars=0) for r in con.execute(
+        f"SELECT {ROUTINE_COLUMNS} FROM routines WHERE snapshot_id = ? ORDER BY routine_id", [snap[0]]).fetchall()]
+    out["source"] = "catalog (datasets.get and routines.get, free)"
+    return out
+
+
+ROUTINE_COLUMNS = "fqn, type, language, arguments, return_type, substr(description, 1, 1000), definition"
+
+
+def _routine(r, definition_chars: int | None = None) -> dict:
+    """definition_chars: None keeps the whole body, 0 drops it, n keeps an n-character excerpt."""
+    args = json.loads(r[3]) if r[3] else []
+    signature = ", ".join(f"{a.get('name') or ''} {a.get('type') or 'ANY TYPE'}".strip() for a in args)
+    out = {"routine": r[0], "type": r[1], "language": r[2], "signature": f"({signature})",
+           "returns": r[4], "description": r[5]}
+    if definition_chars != 0:
+        out["definition"] = r[6] if definition_chars is None or r[6] is None else r[6][:definition_chars]
+    return out
+
+
+def describe_routine(con, fqn: str) -> dict:
+    text(fqn, "routine")
+    row = con.execute(f"""
+        WITH latest AS (SELECT dataset, max(snapshot_id) AS snapshot_id FROM snapshots GROUP BY dataset)
+        SELECT {ROUTINE_COLUMNS}, created, modified FROM routines JOIN latest USING (dataset, snapshot_id)
+        WHERE fqn = ?""", [fqn]).fetchone()
+    if row is None:
+        raise MissingTable("Routine is not in the latest catalog snapshot; harvest its dataset first.")
+    out = _routine(row)
+    out.update(created=_iso(row[7]), modified=_iso(row[8]), source="catalog (routines.get, free)")
+    return out
+
+
+def search_routines(con, q: str = "", limit: int = 50, offset: int = 0) -> dict:
+    """Literal substring search over routine names, descriptions and definitions."""
+    q = text(q, "q", empty=True).strip()
+    integer(limit, "limit", 1, SEARCH_LIMIT)
+    integer(offset, "offset", 0, 1_000_000)
+    rows = con.execute(f"""
+        WITH latest AS (SELECT dataset, max(snapshot_id) AS snapshot_id FROM snapshots GROUP BY dataset)
+        SELECT {ROUTINE_COLUMNS} FROM routines JOIN latest USING (dataset, snapshot_id)
+        WHERE $q = '' OR contains(lower(fqn), lower($q)) OR contains(lower(description), lower($q))
+              OR contains(lower(definition), lower($q))
+        ORDER BY fqn LIMIT $limit OFFSET $offset
+    """, {"q": q, "limit": limit + 1, "offset": offset}).fetchall()
+    # Definitions are excerpts here; describe_routine returns the whole body.
+    return {"items": [_routine(r, definition_chars=1000) for r in rows[:limit]],
+            "next_offset": offset + limit if len(rows) > limit else None}
