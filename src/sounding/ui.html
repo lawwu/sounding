@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Sounding</title>
+<style>
+  :root {
+    --bg: #f7f7f5; --panel: #ffffff; --ink: #1d1f21; --muted: #6b6f76; --line: #e3e3df;
+    --accent: #1f6feb; --accent-soft: #e8f0fe; --free: #1a7f37; --free-soft: #e6f4ea;
+    --warn: #9a6700; --warn-soft: #fff4d6; --bad: #cf222e; --bar: #9bb8f0;
+    --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #111315; --panel: #1a1d20; --ink: #e6e6e3; --muted: #9a9ea6; --line: #2c3035;
+      --accent: #6ea8ff; --accent-soft: #1d2a3f; --free: #5cc27a; --free-soft: #16301f;
+      --warn: #e3b341; --warn-soft: #3a2e10; --bad: #ff7b72; --bar: #3d5f99;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body { background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, sans-serif;
+         display: flex; flex-direction: column; }
+  header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; border-bottom: 1px solid var(--line);
+           background: var(--panel); flex-wrap: wrap; }
+  header h1 { font-size: 16px; margin: 0; letter-spacing: .02em; }
+  header h1 span { color: var(--muted); font-weight: 400; margin-left: 6px; }
+  #stats { color: var(--muted); font-size: 12px; margin-left: auto; }
+  #q { flex: 1 1 320px; max-width: 560px; padding: 8px 12px; font-size: 15px; border: 1px solid var(--line);
+       border-radius: 8px; background: var(--bg); color: var(--ink); outline: none; }
+  #q:focus { border-color: var(--accent); }
+  main { flex: 1; display: grid; grid-template-columns: minmax(300px, 420px) 1fr; min-height: 0; }
+  #results { overflow-y: auto; border-right: 1px solid var(--line); }
+  #count { padding: 8px 16px; color: var(--muted); font-size: 12px; border-bottom: 1px solid var(--line); }
+  .r { padding: 10px 16px; border-bottom: 1px solid var(--line); cursor: pointer; }
+  .r:hover { background: var(--accent-soft); }
+  .r.sel { background: var(--accent-soft); box-shadow: inset 3px 0 var(--accent); }
+  .r .name { font-family: var(--mono); font-size: 13px; word-break: break-all; }
+  .r .name b { font-weight: 600; }
+  .r .ds { color: var(--muted); }
+  .r .meta { color: var(--muted); font-size: 12px; margin-top: 2px; display: flex; gap: 10px; flex-wrap: wrap; }
+  .r .cols { font-family: var(--mono); font-size: 11px; color: var(--accent); margin-top: 3px; }
+  mark { background: var(--warn-soft); color: inherit; border-radius: 2px; }
+  #detail { overflow-y: auto; padding: 0 24px 40px; }  /* no top padding: sticky th pins to the real top */
+  .empty { color: var(--muted); padding: 40px 0; text-align: center; }
+  th { z-index: 1; }
+  h2 { font-family: var(--mono); font-size: 16px; margin: 20px 0 8px; word-break: break-all; }
+  h3 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 24px 0 8px;
+       display: flex; align-items: center; gap: 10px; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; }
+  .chip { border: 1px solid var(--line); border-radius: 999px; padding: 2px 10px; font-size: 12px; background: var(--panel); }
+  .chip.free { color: var(--free); background: var(--free-soft); border-color: transparent; }
+  .chip.cost { color: var(--warn); background: var(--warn-soft); border-color: transparent; }
+  .desc { color: var(--muted); margin: 10px 0 0; max-width: 80ch; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: left; padding: 5px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+  th { font-weight: 600; color: var(--muted); font-size: 12px; position: sticky; top: 0; background: var(--bg); }
+  td.path { font-family: var(--mono); font-size: 12px; white-space: nowrap; }
+  td.path .p { color: var(--muted); }
+  td.type { font-family: var(--mono); font-size: 12px; color: var(--muted); }
+  td.cost { width: 190px; white-space: nowrap; }
+  .bar { height: 8px; background: var(--bar); border-radius: 2px; display: inline-block; vertical-align: middle; margin-right: 6px; }
+  .num { font-variant-numeric: tabular-nums; }
+  button { font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--line);
+           background: var(--panel); color: var(--ink); cursor: pointer; }
+  button:hover { border-color: var(--accent); }
+  button:disabled { opacity: .5; cursor: progress; }
+  .scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 8px; background: var(--panel); }
+  .scroll table td { white-space: nowrap; max-width: 320px; overflow: hidden; text-overflow: ellipsis; }
+  textarea { width: 100%; min-height: 90px; font-family: var(--mono); font-size: 12px; padding: 8px; border-radius: 8px;
+             border: 1px solid var(--line); background: var(--panel); color: var(--ink); resize: vertical; }
+  .est { margin-top: 8px; font-size: 13px; }
+  .est .big { font-size: 18px; font-weight: 600; }
+  .err { color: var(--bad); font-size: 12px; white-space: pre-wrap; }
+  .hint { color: var(--muted); font-size: 12px; font-weight: 400; text-transform: none; letter-spacing: 0; }
+  @media (max-width: 760px) {
+    main { grid-template-columns: 1fr; grid-template-rows: 40% 60%; }
+    #results { border-right: 0; border-bottom: 1px solid var(--line); }
+    #detail { padding: 0 16px 16px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Sounding<span>BigQuery catalog</span></h1>
+  <input id="q" type="search" placeholder="Search tables, columns, descriptions…  (/ to focus)" autofocus autocomplete="off">
+  <div id="stats"></div>
+</header>
+<main>
+  <section id="results"><div id="count"></div><div id="list"></div></section>
+  <section id="detail"><div class="empty">Pick a table to see its schema, size and cost.<br>Search and table pages never call BigQuery.</div></section>
+</main>
+<script>
+const $ = (s, el = document) => el.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const hl = (s, q) => { s = esc(s); if (!q) return s; const i = s.toLowerCase().indexOf(esc(q).toLowerCase());
+  return i < 0 ? s : s.slice(0, i) + "<mark>" + s.slice(i, i + esc(q).length) + "</mark>" + s.slice(i + esc(q).length); };
+const bytes = b => { if (b == null) return "—"; const u = ["B","KB","MB","GB","TB","PB"]; let i = 0;
+  while (b >= 1000 && i < u.length - 1) { b /= 1000; i++; } return (i ? b.toFixed(b < 10 ? 2 : 1) : b) + " " + u[i]; };
+const num = n => n == null ? "—" : Number(n).toLocaleString();
+const usd = d => d == null ? "—" : d < 0.01 ? (d === 0 ? "$0" : "<$0.01") : "$" + d.toFixed(2);
+const USD_PER_TB = 6.25 / 1.099511627776;  // $6.25/TiB on demand, per decimal TB
+const ago = iso => { if (!iso) return "—"; const d = (Date.now() - new Date(iso)) / 864e5;
+  return d < 1 ? "today" : d < 2 ? "1 day ago" : d < 60 ? Math.round(d) + " days ago" : d < 730 ? Math.round(d / 30) + " months ago" : Math.round(d / 365) + " years ago"; };
+async function api(path, body) {
+  const r = await fetch(path, body ? {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)} : {});
+  const j = await r.json(); if (!r.ok || j.error) throw new Error(j.error || r.statusText); return j;
+}
+
+let current = null, seq = 0;
+
+async function search() {
+  const q = $("#q").value.trim(), my = ++seq;
+  const rows = await api("/api/search?q=" + encodeURIComponent(q));
+  if (my !== seq) return;  // a newer keystroke won
+  $("#count").textContent = rows.length >= 200 ? "First 200 matches, largest first" : `${rows.length} table${rows.length === 1 ? "" : "s"}, largest first`;
+  $("#list").innerHTML = rows.map(r => {
+    const [p, d, t] = r.table.split(".");
+    const cols = r.matched_columns.slice(0, 4).map(c => hl(c, q)).join(", ") + (r.matched_columns.length > 4 ? ` +${r.matched_columns.length - 4}` : "");
+    return `<div class="r${r.table === current ? " sel" : ""}" data-fqn="${esc(r.table)}">
+      <div class="name"><span class="ds">${hl(d, q)}.</span><b>${hl(t, q)}</b></div>
+      <div class="meta"><span>${bytes(r.bytes)}</span><span>${num(r.rows)} rows</span><span>${r.type === "VIEW" ? "view" : "full scan " + usd(r.full_scan_usd)}</span><span>${ago(r.modified)}</span></div>
+      ${cols ? `<div class="cols">${cols}</div>` : ""}</div>`;
+  }).join("") || `<div class="empty">No tables match “${esc(q)}”.</div>`;
+}
+
+function depth(path) { return (path.match(/\./g) || []).length; }
+
+function renderTable(t) {
+  const maxScan = Math.max(1, ...t.columns.map(c => c.scan_bytes || 0));
+  const hasCosts = t.columns.some(c => c.scan_bytes != null);
+  const hasDesc = t.columns.some(c => c.description);  // public datasets rarely have any
+  const fullUsd = (t.num_bytes || 0) / 1e12 * USD_PER_TB;
+  $("#detail").innerHTML = `
+    <h2>${esc(t.fqn)}</h2>
+    <div class="chips">
+      <span class="chip">${esc(t.type)}</span>
+      <span class="chip num">${num(t.num_rows)} rows</span>
+      <span class="chip num">${bytes(t.num_bytes)}</span>
+      <span class="chip cost" title="On-demand cost of SELECT * with no partition pruning">full scan ${usd(fullUsd)}</span>
+      <span class="chip" title="${esc(t.modified)}">modified ${ago(t.modified)}</span>
+      ${t.partitioning ? `<span class="chip">partitioned ${esc(t.partitioning)}</span>` : ""}
+      ${t.clustering ? `<span class="chip">clustered ${esc(t.clustering)}</span>` : ""}
+      <span class="chip free">from catalog · free</span>
+    </div>
+    ${t.description ? `<p class="desc">${esc(t.description)}</p>` : ""}
+
+    <h3>Schema <span class="hint">${t.columns.length} column paths</span>
+      ${t.type === "TABLE" ? `<button id="costs">${hasCosts ? "Refresh" : "Compute"} column costs</button><span class="hint">one free dry run per top-level column</span>` : ""}</h3>
+    <table><thead><tr><th>Column</th><th>Type</th><th>Mode</th><th>Scan cost</th>${hasDesc ? "<th>Description</th>" : ""}</tr></thead><tbody>
+    ${t.columns.map(c => {
+      const parts = c.path.split("."), leaf = parts.pop();
+      const pre = parts.length ? `<span class="p">${esc(parts.join("."))}.</span>` : "";
+      const bar = c.scan_bytes != null ? `<span class="bar" style="width:${Math.max(2, 120 * c.scan_bytes / maxScan)}px"></span><span class="num">${bytes(c.scan_bytes)}</span>` : "";
+      return `<tr><td class="path" style="padding-left:${8 + 14 * depth(c.path)}px">${pre}${esc(leaf)}</td><td class="type">${esc(c.type)}</td>
+        <td class="type">${esc(c.mode)}</td><td class="cost">${bar}</td>${hasDesc ? `<td>${esc(c.description)}</td>` : ""}</tr>`;
+    }).join("")}</tbody></table>
+
+    ${t.type === "TABLE" ? `<h3>Preview <button id="prev">Load 10 rows</button><span class="hint">tabledata.list · free</span></h3><div id="prevout"></div>` : ""}
+
+    <h3>Cost guard <span class="hint">paste SQL, see what it would scan · dry run · free, nothing executes</span></h3>
+    <textarea id="sql" spellcheck="false">SELECT *\nFROM \`${esc(t.fqn)}\`\nLIMIT 10</textarea>
+    <div><button id="est">Estimate</button></div>
+    <div id="estout" class="est"></div>`;
+
+  $("#est").onclick = estimate;
+  $("#sql").onkeydown = e => { if ((e.metaKey || e.ctrlKey) && e.key === "Enter") estimate(); };
+  if ($("#costs")) $("#costs").onclick = async e => {
+    e.target.disabled = true; e.target.textContent = "Dry-running…";
+    try { renderTable(await api("/api/column-costs", {fqn: t.fqn})); }
+    catch (err) { e.target.insertAdjacentHTML("afterend", `<span class="err">${esc(err.message)}</span>`); e.target.disabled = false; }
+  };
+  if ($("#prev")) $("#prev").onclick = async e => {
+    e.target.disabled = true;
+    try {
+      const rows = await api("/api/preview?fqn=" + encodeURIComponent(t.fqn));
+      const keys = Object.keys(rows[0] || {});
+      const cell = v => esc(typeof v === "object" && v !== null ? JSON.stringify(v) : v);
+      $("#prevout").innerHTML = rows.length ? `<div class="scroll"><table><thead><tr>${keys.map(k => `<th>${esc(k)}</th>`).join("")}</tr></thead>
+        <tbody>${rows.map(r => `<tr>${keys.map(k => `<td title="${cell(r[k])}">${cell(r[k])}</td>`).join("")}</tr>`).join("")}</tbody></table></div>` : `<div class="empty">No rows.</div>`;
+    } catch (err) { $("#prevout").innerHTML = `<div class="err">${esc(err.message)}</div>`; }
+    e.target.disabled = false;
+  };
+}
+
+async function estimate() {
+  const out = $("#estout"); out.innerHTML = "Dry-running…";
+  try {
+    const r = await api("/api/estimate", {sql: $("#sql").value});
+    out.innerHTML = `<span class="big num">${bytes(r.bytes)}</span> would be scanned · <b>${usd(r.usd_on_demand)}</b> on demand
+      <span class="chip free">dry run · free</span><br><span class="hint">reads ${r.referenced_tables.map(esc).join(", ") || "no tables"}</span>`;
+  } catch (err) { out.innerHTML = `<div class="err">${esc(err.message)}</div>`; }
+}
+
+async function open(fqn) {
+  current = fqn;
+  document.querySelectorAll(".r").forEach(el => el.classList.toggle("sel", el.dataset.fqn === fqn));
+  history.replaceState(null, "", "#" + encodeURIComponent(fqn));
+  try { renderTable(await api("/api/table?fqn=" + encodeURIComponent(fqn))); }
+  catch (err) { $("#detail").innerHTML = `<div class="err">${esc(err.message)}</div>`; }
+}
+
+let timer;
+$("#q").addEventListener("input", () => { clearTimeout(timer); timer = setTimeout(search, 150); });
+$("#list").addEventListener("click", e => { const r = e.target.closest(".r"); if (r) open(r.dataset.fqn); });
+document.addEventListener("keydown", e => { if (e.key === "/" && document.activeElement.tagName !== "INPUT" && document.activeElement.tagName !== "TEXTAREA") { e.preventDefault(); $("#q").focus(); } });
+
+api("/api/stats").then(s => { $("#stats").textContent = `${s.datasets} datasets · ${num(s.tables)} tables · ${bytes(s.bytes)} · harvested ${ago(s.harvested_at)}`; });
+search();
+if (location.hash) open(decodeURIComponent(location.hash.slice(1)));
+</script>
+</body>
+</html>

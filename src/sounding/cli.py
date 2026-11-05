@@ -7,6 +7,7 @@
   sounding estimate "<sql>"            # free dry run
   sounding preview <project.dataset.table>        # free tabledata.list
   sounding mcp                         # stdio MCP server for agents
+  sounding ui [--port 8765] [--open]   # local search UI
 """
 
 from __future__ import annotations
@@ -26,12 +27,18 @@ def main() -> None:
     sub.add_parser("estimate", help="dry-run a query").add_argument("sql")
     sub.add_parser("preview", help="sample rows via tabledata.list").add_argument("table")
     sub.add_parser("mcp", help="run the stdio MCP server")
+    ui = sub.add_parser("ui", help="run the local search UI")
+    ui.add_argument("--port", type=int, default=8765)
+    ui.add_argument("--open", action="store_true", help="open it in your browser")
     a = p.parse_args()
 
     # Imports are deferred so `sounding --help` stays fast.
     if a.cmd == "mcp":
         from .mcp_server import serve
         return serve()
+    if a.cmd == "ui":
+        from .ui import serve as serve_ui
+        return serve_ui(a.port, a.open)
     from . import bq, catalog
     if a.cmd == "harvest":
         bq.harvest(a.datasets)

@@ -1,0 +1,6 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    { "name": "sounding-ui", "runtimeExecutable": "uv", "runtimeArgs": ["run", "sounding", "ui", "--port", "8765"], "port": 8765 }
+  ]
+}

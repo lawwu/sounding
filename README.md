@@ -41,6 +41,21 @@ uv run sounding preview bigquery-public-data.thelook_ecommerce.orders
 
 The catalog lives at `~/.sounding/catalog.duckdb`. Set `SOUNDING_CATALOG` to put it elsewhere.
 
+### Search UI
+
+```bash
+uv run sounding ui --open      # http://127.0.0.1:8765, localhost only
+```
+
+The page has live search over table names, column paths and descriptions, and reports which
+columns matched. Pick a table to see its size, freshness, full-scan cost, and nested schema.
+Each table page has three free actions:
+- **Column costs:** one dry run per column, drawn as bars.
+- **Preview:** 10 rows via `tabledata.list`.
+- **Cost guard:** paste SQL and see the bytes and dollars it would scan, without running it.
+
+Search and table pages never call BigQuery.
+
 ### Agents (MCP)
 
 ```json
@@ -71,7 +86,7 @@ and the Python MCP SDK is the reference implementation.
 2. Snapshot diffs: row-count growth, schema drift, late tables
 3. Table families: collapse date shards (`ga_sessions_*`, `gsod*`)
 4. Join inference from column name, type and value overlap
-5. Web UI: an overview and table pages with a dry-run cost guard
+5. ✅ Search UI (`sounding ui`) with column costs, preview and a dry-run cost guard; next: an overview page
 6. Opt-in billed profiling behind a byte cap and approval, with results cached in the catalog
 
 ## Development
