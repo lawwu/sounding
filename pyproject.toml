@@ -1,0 +1,22 @@
+[project]
+name = "sounding"
+version = "0.1.0"
+description = "Take a sounding before you dive: a cost-aware BigQuery metadata catalog for people and agents."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "google-cloud-bigquery>=3.25",
+  "duckdb>=1.1",
+  "pyarrow>=17",
+  "mcp>=2",
+]
+
+[project.scripts]
+sounding = "sounding.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
