@@ -163,3 +163,7 @@ the JavaScript security, pagination and stale-response tests (run by pytest;
 skipped with an explicit reason if Node is missing). CI installs Node and runs the
 full suite. Tests also cover process/thread locks, rollback, Arrow field mapping,
 legacy catalogs, UTC round trips, price minimums, HTTP security, and MCP over stdio.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
