@@ -3,7 +3,7 @@ name = "sounding"
 version = "0.1.0"
 description = "Take a sounding before you dive: a cost-aware BigQuery metadata catalog for people and agents."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.14"
 dependencies = [
   "google-cloud-bigquery>=3.25",
   "duckdb>=1.1",
