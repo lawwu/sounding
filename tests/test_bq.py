@@ -132,10 +132,35 @@ def test_known_estimate_includes_minimum_and_multiple_table_range(monkeypatch):
     assert out["usd_on_demand"] is None and out["usd_on_demand_range"]["min"] is None
 
 
-def test_information_schema_and_bad_inputs_do_not_call_bigquery():
-    for sql in ["SELECT * FROM p.d.INFORMATION_SCHEMA.TABLES", "", "x" * (bq.MAX_SQL_LENGTH + 1)]:
+def test_bad_inputs_do_not_call_bigquery():
+    for sql in ["", "x" * (bq.MAX_SQL_LENGTH + 1)]:
         with pytest.raises(SoundingError):
             bq.dry_run(sql)
+
+
+def test_information_schema_is_only_dry_run(monkeypatch):
+    c = fake_client(monkeypatch)
+    c.query.return_value = query_job(10 * 2**20)
+    sql = "SELECT * FROM p.d.INFORMATION_SCHEMA.TABLES"
+    assert bq.dry_run(sql)["estimate_status"] == "estimated"
+    assert c.query.call_args.kwargs["job_config"].dry_run is True
+
+
+def test_zero_byte_select_explains_why_cost_is_unknown(monkeypatch):
+    c = fake_client(monkeypatch)
+    c.query.return_value = query_job(0)
+    out = bq.dry_run("SELECT * FROM `p.d.t` WHERE FALSE")
+    assert out["estimate_status"] == "unknown" and out["reported_bytes"] == 0
+    assert any("reported 0 bytes" in w and "external" in w for w in out["warnings"])
+
+
+def test_missing_accuracy_field_is_reported_not_silent(monkeypatch, caplog):
+    c = fake_client(monkeypatch)
+    c.query.return_value = query_job(100, accuracy=None)
+    out = bq.dry_run("SELECT id FROM `p.d.t`")
+    assert out["estimate_status"] == "unknown"
+    assert any("estimate-accuracy" in w for w in out["warnings"])
+    assert "totalBytesProcessedAccuracy" in caplog.text
 
 
 def test_column_costs_qualify_and_escape_identifiers(seed, monkeypatch):

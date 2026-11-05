@@ -111,16 +111,31 @@ def test_prices_preserve_unknowns_and_include_table_minimums(seed):
         assert catalog.search(con)["items"][0]["full_scan_usd"] is None
 
 
-def test_legacy_catalog_is_preserved(tmp_path):
+def test_legacy_catalog_is_moved_aside_and_replaced(tmp_path, capsys):
     path = tmp_path / "legacy.duckdb"
     with duckdb.connect(str(path)) as con:
         con.execute("CREATE TABLE snapshots(snapshot_id INT, taken_at TIMESTAMP, dataset VARCHAR)")
         con.execute("INSERT INTO snapshots VALUES (1, '2026-01-01', 'p.d')")
     before = path.read_bytes()
-    with pytest.raises(CatalogVersionError, match="new file"):
+    with catalog.connect(path) as con:
+        assert catalog.stats(con)["tables"] == 0
+    moved = [p for p in tmp_path.glob("legacy.v1-*.duckdb")]
+    assert len(moved) == 1 and moved[0].read_bytes() == before
+    assert "moved it to" in capsys.readouterr().err
+    with catalog.connect(path) as con:  # the fresh catalog is reused, not moved again
+        assert catalog.stats(con)["datasets"] == 0
+    assert len(list(tmp_path.glob("legacy.v*-*.duckdb"))) == 1
+
+
+def test_newer_catalog_is_refused_untouched(tmp_path):
+    path = tmp_path / "future.duckdb"
+    with duckdb.connect(str(path)) as con:
+        con.execute("CREATE TABLE catalog_meta (version INTEGER); INSERT INTO catalog_meta VALUES (99)")
+    before = path.read_bytes()
+    with pytest.raises(CatalogVersionError, match="newer"):
         with catalog.connect(path):
             pass
-    assert path.read_bytes() == before
+    assert path.read_bytes() == before and list(tmp_path.glob("future.v*")) == []
 
 
 def test_other_process_waits_for_connection_and_then_succeeds(seed):

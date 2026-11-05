@@ -20,6 +20,10 @@ PORT_TRIES = 10
 
 
 class Server(ThreadingHTTPServer):
+    # The stdlib default backlog is 5. macOS resets connections past it instead of
+    # retrying, so a burst of 8 parallel requests failed there but not on Linux.
+    request_queue_size = 64
+
     def __init__(self, address, handler=None):
         self.api_token = secrets.token_urlsafe(32)
         super().__init__(address, handler or Handler)

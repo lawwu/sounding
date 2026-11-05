@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime as dt
 import os
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -61,31 +62,72 @@ COLUMN_SCHEMA = pa.schema([
 ])
 
 
-def _check_version(con):
+# Paths already checked (or created) at SCHEMA_VERSION in this process, so each request
+# doesn't pay for a second DuckDB open just to re-read the version.
+_VERIFIED: set[Path] = set()
+
+
+def _version(con) -> int | None:
+    """The catalog's schema version; None for a pre-versioning (schema 1) catalog."""
     exists = con.execute("SELECT count(*) FROM duckdb_tables() WHERE table_name = 'catalog_meta'").fetchone()[0]
-    if not exists or con.execute("SELECT version FROM catalog_meta").fetchall() != [(SCHEMA_VERSION,)]:
-        raise CatalogVersionError(
-            "This catalog uses an older or unsupported schema. Preserve it and harvest into a new "
-            "file using SOUNDING_CATALOG; see README 'Catalog upgrades'. No data was changed.")
+    rows = con.execute("SELECT version FROM catalog_meta").fetchall() if exists else []
+    return rows[0][0] if len(rows) == 1 else None
+
+
+def _set_aside(path: Path, version: int | None) -> Path:
+    """Rename an older catalog (and its WAL) next to itself. Nothing is deleted.
+
+    The catalog is a cache that a harvest can rebuild, and older schemas can't be
+    converted reliably (timezone-less timestamps, alias-keyed snapshots), so the
+    default path is reused for a fresh catalog rather than asking every CLI, UI and
+    MCP process to point somewhere new.
+    """
+    stamp = dt.datetime.now(dt.UTC).strftime("%Y%m%dT%H%M%S")
+    target = path.with_name(f"{path.stem}.v{version or 1}-{stamp}{path.suffix}")
+    os.replace(path, target)
+    wal = Path(str(path) + ".wal")
+    if wal.exists():
+        os.replace(wal, Path(str(target) + ".wal"))
+    print(f"sounding: catalog schema {version or 1} is older than {SCHEMA_VERSION}; moved it to {target} "
+          "and started a new catalog. Re-run `sounding harvest` for your datasets.", file=sys.stderr)
+    return target
+
+
+def _open(path: Path, write: bool):
+    try:
+        return duckdb.connect(str(path), read_only=not write)
+    except duckdb.IOException as error:
+        raise CatalogBusy("Catalog is in use by another program. Close it and retry.") from error
 
 
 @contextmanager
 def connect(path: Path | str | None = None, *, write: bool = False):
-    """Acquire the process/thread lock before opening DuckDB; always close before unlocking."""
+    """Acquire the process/thread lock before opening DuckDB; always close before unlocking.
+
+    An older-schema catalog is moved aside (see _set_aside) and replaced by an empty one.
+    A newer-schema catalog is left untouched and refused.
+    """
     path = Path(path or CATALOG).expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
     try:
         with FileLock(str(path) + ".lock", timeout=LOCK_TIMEOUT):
+            if path.exists() and path not in _VERIFIED:
+                with _open(path, write=False) as probe:
+                    version = _version(probe)
+                if version is not None and version > SCHEMA_VERSION:
+                    raise CatalogVersionError(
+                        f"This catalog uses schema {version}, newer than this Sounding supports "
+                        f"({SCHEMA_VERSION}). Upgrade Sounding, or set SOUNDING_CATALOG to another file. "
+                        "No data was changed.")
+                if version != SCHEMA_VERSION:
+                    _set_aside(path, version)
             if not path.exists():
                 with duckdb.connect(str(path)) as initial:
                     initial.execute(SCHEMA)
-            try:
-                con = duckdb.connect(str(path), read_only=not write)
-            except duckdb.IOException as error:
-                raise CatalogBusy("Catalog is in use by another program. Close it and retry.") from error
+            _VERIFIED.add(path)
+            con = _open(path, write)
             try:
                 con.execute("SET TimeZone = 'UTC'")
-                _check_version(con)
                 yield con
             finally:
                 con.close()

@@ -17,7 +17,7 @@ Sounding answers each question from the cheapest source that can.
 | REST `tables.list` / `tables.get` | Schema (nested), descriptions, row and byte counts, last modified, partitioning, clustering, view SQL | $0 (API quota) |
 | `tabledata.list` | Sample rows (tables only, not views) | $0 |
 | Dry run | Estimated bytes, reported referenced tables, and estimate limitations | $0 |
-| INFORMATION_SCHEMA | Partitions, storage, job history | 10 MB minimum for on-demand queries; capacity queries consume slots; never cached: **rejected** |
+| INFORMATION_SCHEMA | Partitions, storage, job history | 10 MB minimum for on-demand queries; capacity queries consume slots; never cached: **not harvested** (the cost guard can still dry-run it for free) |
 | Sampled profiles | `TABLESAMPLE` + `APPROX_*` | Billed: **not used yet** (planned as opt-in, capped, approved) |
 
 Two free tricks come from dry runs:
@@ -27,8 +27,11 @@ Two free tricks come from dry runs:
 Dry runs themselves are free; a zero-byte or incomplete dry run does **not** prove
 the eventual query would be free. Sounding reports unknown estimates as `null`,
 including scripts, dynamic SQL, zero/missing bytes, unknown/lower-bound estimates,
-and referenced routines. It never falls back to executing SQL. INFORMATION_SCHEMA
-is conservatively rejected even if its name appears in a comment or string literal.
+and referenced routines. It never falls back to executing SQL. A SELECT that reports
+0 bytes is explained rather than priced: it may read nothing, or it may read external
+or row-level-secured tables a dry run can't cost. If BigQuery's response ever lacks the
+estimate-accuracy field, every estimate turns unknown and says why. SQL that queries
+INFORMATION_SCHEMA is dry-run like any other SQL; the harvester itself never queries it.
 
 Prices cover scan costs at the **US on-demand list rate of $6.25/TiB**, before the
 monthly free tier and discounts; they do not cover other services or regional rates.
@@ -75,19 +78,13 @@ in this coordination and must close their connections before Sounding opens it.
 
 ### Catalog upgrades
 
-This version uses catalog schema 2. Old catalogs are preserved and rejected with an
-actionable error: their timezone-less timestamps and potentially ambiguous snapshot
-identities cannot be reconstructed reliably. Reharvest into a new file, keeping the
-original for historical inspection:
-
-```bash
-export SOUNDING_CATALOG="$HOME/.sounding/catalog-v2.duckdb"
-uv run sounding harvest bigquery-public-data.thelook_ecommerce
-uv run sounding ui --open
-```
-
-Use the same `SOUNDING_CATALOG` setting for the CLI, UI, and MCP process. No automatic
-deletion or speculative conversion of old catalog data occurs.
+This version uses catalog schema 2. The catalog is a cache that a harvest can rebuild,
+and older schemas can't be converted reliably (timezone-less timestamps, alias-keyed
+snapshots). So the first time any Sounding command opens an older catalog, it renames
+it next to itself (for example `catalog.v1-20261105T082205.duckdb`), starts an empty
+catalog at the same path, and prints a notice. Re-run `sounding harvest` for your
+datasets. Nothing is deleted, and no setting needs to change. A catalog from a *newer*
+Sounding is refused and left untouched.
 
 ### Search UI
 

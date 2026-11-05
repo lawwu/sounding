@@ -1,6 +1,7 @@
 """The only module that calls BigQuery: metadata, dry runs, and tabledata.list only.
 
-No billed queries, Storage Read API, or INFORMATION_SCHEMA calls are used.
+No billed queries or Storage Read API calls are made, and the harvester never reads
+INFORMATION_SCHEMA. User SQL, INFORMATION_SCHEMA included, is only ever dry-run.
 """
 
 from __future__ import annotations
@@ -8,8 +9,8 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import decimal
+import logging
 import os
-import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
 
@@ -77,21 +78,25 @@ def harvest(datasets: list[str]) -> None:
 
 def dry_run(sql: str) -> dict:
     text(sql, "sql", MAX_SQL_LENGTH)
-    # Deliberately conservative, including comments/literals: never submit INFORMATION_SCHEMA.
-    if re.search(r"\bINFORMATION_SCHEMA\b", sql, re.IGNORECASE):
-        raise SoundingError("INFORMATION_SCHEMA is not supported by Sounding.")
+    # Every statement, INFORMATION_SCHEMA included, is submitted only as a dry run, which
+    # BigQuery never bills or executes; test_every_query_is_serialized_as_a_dry_run guards it.
     job = client().query(sql, job_config=bigquery.QueryJobConfig(dry_run=True, use_query_cache=False))
     reported = job.total_bytes_processed
-    # The client has no public property for the REST accuracy field.
     stats = job._properties.get("statistics", {}).get("query", {})
-    accuracy = stats.get("totalBytesProcessedAccuracy", "UNKNOWN")
+    accuracy = _accuracy(stats)
     refs = [f"{r.project}.{r.dataset_id}.{r.table_id}" for r in job.referenced_tables]
     warnings = ["Dry-run estimates are not spending caps; data, pruning and runtime behavior can change costs."]
     reliable = job.statement_type == "SELECT" and reported is not None and reported > 0
     # Scripts, routines, external-service calls and incomplete byte estimates cannot be priced safely.
     reliable = reliable and accuracy in ("PRECISE", "UPPER_BOUND")
     reliable = reliable and not stats.get("referencedRoutines") and not stats.get("externalServiceCosts")
-    if not reliable:
+    if accuracy is None:
+        warnings.append("BigQuery's response had no estimate-accuracy field, so the estimate is treated as unknown. "
+                        "If every estimate says this, google-cloud-bigquery's response format has changed.")
+    if not reliable and reported == 0 and refs and job.statement_type == "SELECT":
+        warnings.append("Cost is unknown: BigQuery reported 0 bytes. The query may read no data, or it may read "
+                        "external or row-level-secured tables whose cost a dry run cannot see.")
+    elif not reliable:
         warnings.append("Cost is unknown: scripts, dynamic SQL, routines, external data and row-level security may be unestimated; zero reported bytes does not mean free execution.")
     complete_refs = job.statement_type == "SELECT" and len(refs) < 50
     price = catalog.billing_range(reported, len(refs)) if reliable and complete_refs else None
@@ -107,6 +112,19 @@ def dry_run(sql: str) -> dict:
             "usd_on_demand_range": price, "price_basis": PRICE_BASIS,
             "referenced_tables": refs, "referenced_tables_complete": complete_refs and reliable,
             "warnings": warnings, "source": "dry run (free; never executes SQL)"}
+
+
+def _accuracy(stats: dict) -> str | None:
+    """statistics.query.totalBytesProcessedAccuracy from the REST response.
+
+    google-cloud-bigquery exposes no public property for it, so this reads the raw
+    response. A missing field makes every estimate unknown (safe, but useless), so it
+    is logged and reported rather than silently defaulted.
+    """
+    accuracy = stats.get("totalBytesProcessedAccuracy")
+    if accuracy is None:
+        logging.warning("dry run response has no totalBytesProcessedAccuracy; treating the estimate as unknown")
+    return accuracy
 
 
 def quote_identifier(name: str) -> str:

@@ -61,7 +61,7 @@ def create_server() -> MCPServer:
               "on-demand scan-price range including billing minimums. Unknown/incomplete estimates "
               "are null, never a promise of $0. Read estimate_status, warnings and price_basis. "
               "Scripts, dynamic SQL, external data and row security may be unestimated. "
-              "This is not a spending cap. INFORMATION_SCHEMA is rejected.")
+              "This is not a spending cap.")
     @tool_errors
     def estimate_query_cost(sql: Annotated[str, Field(min_length=1, max_length=bq.MAX_SQL_LENGTH)]) -> dict:
         return bq.dry_run(sql)
