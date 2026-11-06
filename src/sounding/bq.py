@@ -12,16 +12,20 @@ import decimal
 import logging
 import os
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 from google.api_core.exceptions import Forbidden
 from google.cloud import bigquery
 
 from . import catalog
+from .progress import Quiet
 from .errors import SoundingError, integer, text
 
 JOB_PROJECT = os.environ.get("SOUNDING_JOB_PROJECT")
-GET_TABLE_WORKERS = 16
+GET_TABLE_WORKERS = 16  # concurrent tables.get / routines.get calls within one dataset
+DATASET_WORKERS = 4     # datasets harvested at once; up to 4 x 16 requests in flight
+DRY_RUN_WORKERS = 16    # concurrent column-cost dry runs, well under BigQuery's per-user API rate
 MAX_SQL_LENGTH = 100_000
 PRICE_BASIS = "US on-demand scan list price ($6.25/TiB); excludes free tier, discounts and other services."
 PRICING_DOC = "https://cloud.google.com/bigquery/pricing#free"
@@ -159,30 +163,49 @@ def routine_record(r: dict, dataset: str) -> dict:
             "resource": {k: v for k, v in r.items() if k not in ROUTINE_DROP}}
 
 
-def harvest(datasets: list[str]) -> dict:
+def harvest(datasets: list[str], progress: Quiet | None = None) -> dict:
     """Free metadata calls only: datasets.get, tables.list/get and routines.list/get.
 
-    Returns a receipt counting the get calls made. None of them is a job.
+    Datasets are crawled concurrently, each publishing its own snapshot, so a failure
+    leaves only that dataset's previous snapshot current. Every dataset is attempted;
+    if any failed, the first error is raised once the others finish. Returns a receipt
+    counting the get calls made. None of them is a job.
     """
+    progress = progress or Quiet()
     # Fail early on unsupported catalogs, but release the connection before network I/O.
     with catalog.connect():
         pass
     c = client()
-    counts = {"datasets.get": 0, "tables.get": 0, "routines.get": 0}
-    for raw_ds in datasets:
+    refs = []
+    for raw_ds in datasets:  # validate every name before any network call
         text(raw_ds, "dataset")
         try:
-            ref = bigquery.DatasetReference.from_string(raw_ds, default_project=c.project)
+            refs.append(bigquery.DatasetReference.from_string(raw_ds, default_project=c.project))
         except ValueError as error:
             raise SoundingError("Dataset must be dataset or project.dataset.") from error
+    counts = {"datasets.get": 0, "tables.get": 0, "routines.get": 0}
+    counts_lock = threading.Lock()
+    progress.add(len(refs))  # one unit per dataset's list calls; tables and routines add theirs
+
+    def crawl(ref) -> None:
         ds = str(ref)
         dataset_resource = c.get_dataset(ref).to_api_repr()
-        refs = [i.reference for i in c.list_tables(ds)]
+        table_refs = [i.reference for i in c.list_tables(ds)]
+        progress.add(len(table_refs))
         with ThreadPoolExecutor(GET_TABLE_WORKERS) as pool:
-            fetched = list(pool.map(c.get_table, refs))
+            def get_table(r):
+                t = c.get_table(r)
+                progress.advance()
+                return t
+            fetched = list(pool.map(get_table, table_refs))
             try:
                 routine_refs = [i.reference for i in c.list_routines(ds)]
-                routines = list(pool.map(c.get_routine, routine_refs))
+                progress.add(len(routine_refs))
+                def get_routine(r):
+                    routine = c.get_routine(r)
+                    progress.advance()
+                    return routine
+                routines = list(pool.map(get_routine, routine_refs))
                 routines_status = "harvested"
             except Forbidden:
                 # Routine access is a separate permission; tables are still worth keeping.
@@ -195,12 +218,26 @@ def harvest(datasets: list[str]) -> dict:
         routine_rows = [routine_record(r.to_api_repr(), ds) for r in routines]
         sid = catalog.save_snapshot(ds, table_rows, col_rows,
                                     dataset_record(dataset_resource, ds, routines_status), routine_rows)
+        progress.advance()
         extra = f", {len(routine_rows)} routines" if routines_status == "harvested" else ", routines denied"
-        print(f"{ds}: {len(fetched)} tables, {len(col_rows)} column paths{extra} (snapshot {sid})",
-              file=sys.stderr)
-        counts["datasets.get"] += 1
-        counts["tables.get"] += len(fetched)
-        counts["routines.get"] += len(routines)
+        progress.log(f"{ds}: {len(fetched)} tables, {len(col_rows)} column paths{extra} (snapshot {sid})")
+        with counts_lock:
+            counts["datasets.get"] += 1
+            counts["tables.get"] += len(fetched)
+            counts["routines.get"] += len(routines)
+
+    errors = []
+    with ThreadPoolExecutor(min(DATASET_WORKERS, len(refs)) or 1) as pool:
+        futures = {pool.submit(crawl, ref): str(ref) for ref in refs}
+        for future, ds in futures.items():
+            try:
+                future.result()
+            except Exception as error:
+                errors.append(error)
+                progress.log(f"{ds}: failed ({type(error).__name__}); its previous snapshot stays current")
+    progress.close()
+    if errors:
+        raise errors[0]
     return free_api_receipt("datasets.get", "tables.list", "tables.get", "routines.list", "routines.get") | {"get_calls": counts}
 
 
@@ -304,7 +341,7 @@ def quote_identifier(name: str) -> str:
     return "`" + name.replace("\\", "\\\\").replace("`", "\\`") + "`"
 
 
-def column_costs(fqn: str) -> dict:
+def column_costs(fqn: str, progress: Quiet | None = None) -> dict:
     """Compute outside the lock, then atomically cache only against the unchanged current snapshot.
 
     Returns {"columns": [(path, bytes)], "receipt": ...}, the receipt covering every dry run.
@@ -314,8 +351,17 @@ def column_costs(fqn: str) -> dict:
     if table["type"] != "TABLE":
         raise SoundingError("Column costs require a native table.")
     cols = [c["path"] for c in table["columns"] if "." not in c["path"]]
-    runs = [(col, dry_run(f"SELECT sounding_source.{quote_identifier(col)} FROM {quote_identifier(fqn)} AS sounding_source"))
-            for col in cols]
+    progress = progress or Quiet()
+    progress.add(len(cols))
+
+    def cost(col):
+        result = dry_run(f"SELECT sounding_source.{quote_identifier(col)} FROM {quote_identifier(fqn)} AS sounding_source")
+        progress.advance()
+        return col, result
+
+    with ThreadPoolExecutor(DRY_RUN_WORKERS) as pool:  # map keeps column order; the first failure is raised
+        runs = list(pool.map(cost, cols))
+    progress.close()
     out = [(col, r["bytes"]) for col, r in runs]
     with catalog.connect(write=True) as con:
         if catalog.describe(con, fqn)["snapshot_id"] != table["snapshot_id"]:

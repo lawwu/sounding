@@ -50,8 +50,9 @@ def _main() -> None:
         from .ui import serve as serve_ui
         return serve_ui(a.port, a.open)
     from . import bq, catalog
+    from .progress import for_terminal
     if a.cmd == "harvest":
-        print(_receipt_line(bq.harvest(a.datasets)), file=sys.stderr)
+        print(_receipt_line(bq.harvest(a.datasets, for_terminal("harvesting"))), file=sys.stderr)
     elif a.cmd == "show":
         offset = 0
         while offset is not None:
@@ -80,7 +81,7 @@ def _main() -> None:
         with catalog.connect() as con:
             print(json.dumps(catalog.describe_routine(con, a.routine), indent=2))
     elif a.cmd == "column-costs":
-        result = bq.column_costs(a.table)
+        result = bq.column_costs(a.table, for_terminal("dry runs"))
         for col, b in sorted(result["columns"], key=lambda x: -(x[1] or 0)):
             size = "unknown" if b is None else f"{b / 1e6:.2f} MB"
             print(f"{size:>14}  {col}")

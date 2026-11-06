@@ -441,3 +441,69 @@ def test_harvest_returns_a_receipt_of_free_calls(monkeypatch):
     receipt = bq.harvest(["p.d"])
     assert receipt["jobs_created"] == 0 and receipt["free"] is True
     assert receipt["get_calls"] == {"datasets.get": 1, "tables.get": 2, "routines.get": 1}
+
+
+def test_column_cost_dry_runs_run_concurrently_in_column_order(seed, monkeypatch):
+    seed(columns=[column_row(c) for c in "abcd"])
+    both_running = threading.Barrier(2, timeout=5)  # a serial loop would time out here
+    def dry(sql):
+        if "`a`" in sql or "`b`" in sql:
+            both_running.wait()
+        return {"bytes": len(sql)}
+    monkeypatch.setattr(bq, "dry_run", dry)
+    progress = Recorder()
+    result = bq.column_costs("p.d.t", progress)
+    assert [c for c, _ in result["columns"]] == list("abcd")
+    assert progress.total == progress.done == 4
+
+
+class Recorder:
+    def __init__(self):
+        self.total = self.done = 0
+        self.lines, self.lock = [], threading.Lock()
+    def add(self, n=1):
+        with self.lock: self.total += n
+    def advance(self, n=1):
+        with self.lock: self.done += n
+    def log(self, line):
+        with self.lock: self.lines.append(line)
+    def close(self):
+        pass
+
+
+def test_datasets_are_harvested_concurrently_with_progress(monkeypatch):
+    c = fake_client(monkeypatch, [remote_table("a"), remote_table("b")], [remote_routine()])
+    both_running = threading.Barrier(2, timeout=5)
+    dataset = c.get_dataset.return_value
+    c.get_dataset.side_effect = lambda ref: both_running.wait() and dataset or dataset
+    progress = Recorder()
+    receipt = bq.harvest(["p.one", "p.two"], progress)
+    assert receipt["get_calls"] == {"datasets.get": 2, "tables.get": 4, "routines.get": 2}
+    assert progress.total == progress.done == 2 + 4 + 2  # one unit per dataset, table and routine
+    assert sorted(line.split(":")[0] for line in progress.lines) == ["p.one", "p.two"]
+    with catalog.connect() as con:
+        assert catalog.stats(con)["datasets"] == 2
+
+
+def test_one_failed_dataset_does_not_stop_the_others(monkeypatch):
+    c = fake_client(monkeypatch)
+    dataset = c.get_dataset.return_value
+    def get_dataset(ref):
+        if ref.dataset_id == "bad":
+            raise RuntimeError("network failure")
+        return dataset
+    c.get_dataset.side_effect = get_dataset
+    progress = Recorder()
+    with pytest.raises(RuntimeError, match="network failure"):
+        bq.harvest(["p.bad", "p.good"], progress)
+    with catalog.connect() as con:
+        assert [r[0] for r in con.execute("SELECT dataset FROM snapshots").fetchall()] == ["p.good"]
+    assert any(line.startswith("p.bad: failed (RuntimeError)") for line in progress.lines)
+    assert not any("network failure" in line for line in progress.lines)  # error details stay out of logs
+
+
+def test_bad_dataset_name_fails_before_any_network_call(monkeypatch):
+    c = fake_client(monkeypatch)
+    with pytest.raises(SoundingError):
+        bq.harvest(["p.ok", ""])
+    c.get_dataset.assert_not_called()
