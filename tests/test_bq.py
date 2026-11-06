@@ -50,14 +50,16 @@ def fake_client(monkeypatch, tables=None, routines=(), dataset=None):
     return client
 
 
-def query_job(size=123, statement="SELECT", accuracy="PRECISE", refs=None, **stats):
+def query_job(size=123, statement="SELECT", accuracy="PRECISE", refs=None, job_ref=None, dry=True, **stats):
+    """A dry-run response as BigQuery returns it: no job ID, dryRun echoed, 0 bytes billed."""
     refs = [dict(projectId="p", datasetId="d", tableId="t")] if refs is None else refs
-    stats.update(statementType=statement, totalBytesProcessedAccuracy=accuracy, referencedTables=refs)
+    stats = dict(statementType=statement, totalBytesProcessedAccuracy=accuracy, referencedTables=refs,
+                 totalBytesBilled="0") | stats
     if size is not None:
         stats["totalBytesProcessed"] = str(size)
-    return bigquery.QueryJob.from_api_repr({"jobReference": {"projectId": "p", "jobId": "dry"},
-        "configuration": {"dryRun": True, "query": {"query": "SELECT 1"}},
-        "statistics": {"query": stats}}, Mock(project="p"))
+    config = {"query": {"query": "SELECT 1"}} | ({"dryRun": True} if dry else {})
+    return bigquery.QueryJob.from_api_repr({"jobReference": {"projectId": "p"} | (job_ref or {}),
+        "configuration": config, "statistics": {"query": stats}}, Mock(project="p"))
 
 
 def test_nested_empty_schemas_and_canonical_dataset(monkeypatch):
@@ -180,6 +182,83 @@ def test_missing_accuracy_field_is_reported_not_silent(monkeypatch, caplog):
     assert "totalBytesProcessedAccuracy" in caplog.text
 
 
+def test_dry_run_receipt_copies_bigquery_evidence(monkeypatch):
+    c = fake_client(monkeypatch)
+    c.query.return_value = query_job(100)
+    receipt = bq.dry_run("SELECT id FROM `p.d.t`")["receipt"]
+    assert receipt == {"call": "jobs.insert (dry run)", "dry_run_confirmed": True, "billed_bytes": 0,
+                       "job_id": None, "job_project": "p", "free": True, "source": receipt["source"]}
+
+
+@pytest.mark.parametrize("response", [dict(totalBytesBilled="10485760"), dict(job_ref={"jobId": "real"}),
+                                      dict(dry=False), dict(totalBytesBilled=None)])
+def test_unconfirmed_dry_run_receipt_is_flagged(monkeypatch, response):
+    c = fake_client(monkeypatch)
+    stats = {"totalBytesBilled": response.pop("totalBytesBilled")} if "totalBytesBilled" in response else {}
+    job = query_job(100, **response, **stats)
+    if stats.get("totalBytesBilled") is None and "totalBytesBilled" in stats:
+        del job._properties["statistics"]["query"]["totalBytesBilled"]
+    c.query.return_value = job
+    out = bq.dry_run("SELECT id FROM `p.d.t`")
+    assert out["receipt"]["free"] is False
+    assert any("did not confirm a free dry run" in w for w in out["warnings"])
+
+
+def test_combined_receipt_is_free_only_if_every_dry_run_was():
+    free = {"dry_run_confirmed": True, "billed_bytes": 0, "job_id": None, "free": True}
+    assert bq.combine_receipts([free, free]) | {"source": None} == {
+        "call": "jobs.insert (dry run)", "calls": 2, "dry_run_confirmed": True, "billed_bytes": 0,
+        "jobs_created": 0, "free": True, "source": None}
+    worse = bq.combine_receipts([free, {"dry_run_confirmed": True, "billed_bytes": None, "job_id": "j", "free": False}])
+    assert worse["free"] is False and worse["billed_bytes"] is None and worse["jobs_created"] == 1
+    assert bq.combine_receipts([{}])["free"] is False  # a missing receipt is never assumed free
+
+
+def job_listing(job_id, kind="query", billed="0", **query):
+    resource = {"jobReference": {"projectId": "p", "jobId": job_id}, "state": "DONE",
+                "configuration": {kind: {"query": "SELECT 1"} if kind == "query" else {}},
+                "statistics": {"creationTime": "1793938978896", "totalSlotMs": "10",
+                               kind: ({} if billed is None else {"totalBytesBilled": billed}) | query}}
+    return bigquery.job.UnknownJob.from_api_repr(resource, Mock(project="p")) if kind != "query" else \
+        bigquery.QueryJob.from_api_repr(resource, Mock(project="p"))
+
+
+def test_cost_report_with_no_jobs_proves_nothing_was_billed(monkeypatch):
+    c = fake_client(monkeypatch)
+    c.list_jobs.return_value = []
+    r = bq.cost_report(24)
+    assert (r["project"], r["job_count"], r["billed_bytes"], r["usd_on_demand"], r["jobs"]) == ("p", 0, 0, 0.0, [])
+    kwargs = c.list_jobs.call_args.kwargs
+    assert kwargs["max_results"] == bq.COST_REPORT_MAX_JOBS + 1 and "all_users" not in kwargs
+    assert dt.datetime.fromisoformat(r["until"]) - kwargs["min_creation_time"] == dt.timedelta(hours=24)
+    c.query.assert_not_called()
+
+
+def test_cost_report_sums_bigquery_billed_bytes(monkeypatch):
+    c = fake_client(monkeypatch)
+    c.list_jobs.return_value = [job_listing("a", billed=str(10 * 2**20), statementType="SELECT"),
+                                job_listing("b", billed="0", cacheHit=True)]
+    r = bq.cost_report(1)
+    assert r["job_count"] == 2 and r["billed_bytes"] == 10 * 2**20
+    assert r["usd_on_demand"] == catalog.usd(10 * 2**20)
+    assert r["jobs"][0]["created"].endswith("+00:00") and r["jobs"][1]["cache_hit"] is True
+    c.list_jobs.return_value = [job_listing("a", billed=None)]
+    r = bq.cost_report(1)
+    assert r["billed_bytes"] is None and r["usd_on_demand"] is None
+    assert any("total is unknown" in w for w in r["warnings"])
+
+
+def test_cost_report_bounds_and_truncation(monkeypatch):
+    for hours in [0, bq.COST_REPORT_MAX_HOURS + 1, True]:
+        with pytest.raises(SoundingError):
+            bq.cost_report(hours)
+    c = fake_client(monkeypatch)
+    monkeypatch.setattr(bq, "COST_REPORT_MAX_JOBS", 2)
+    c.list_jobs.return_value = [job_listing(str(i)) for i in range(3)]
+    r = bq.cost_report(1)
+    assert r["truncated"] and r["job_count"] == 2 and any("Use a shorter window" in w for w in r["warnings"])
+
+
 def test_column_costs_qualify_and_escape_identifiers(seed, monkeypatch):
     seed(columns=[column_row("t"), column_row("back`tick\\name")])
     calls = []
@@ -190,7 +269,9 @@ def test_column_costs_qualify_and_escape_identifiers(seed, monkeypatch):
             assert catalog.stats(con)["tables"] == 1
         return {"bytes": 42}
     monkeypatch.setattr(bq, "dry_run", dry)
-    assert bq.column_costs("p.d.t") == [("t",42),("back`tick\\name",42)]
+    result = bq.column_costs("p.d.t")
+    assert result["columns"] == [("t",42),("back`tick\\name",42)]
+    assert result["receipt"]["calls"] == 2 and result["receipt"]["free"] is False  # the fake returns no receipts
     assert calls == ["SELECT sounding_source.`t` FROM `p.d.t` AS sounding_source",
                      "SELECT sounding_source.`back\\`tick\\\\name` FROM `p.d.t` AS sounding_source"]
     with catalog.connect() as con:
@@ -199,7 +280,7 @@ def test_column_costs_qualify_and_escape_identifiers(seed, monkeypatch):
 
 def test_column_costs_empty_deleted_and_changed_snapshot(seed, monkeypatch):
     seed(columns=[])
-    assert bq.column_costs("p.d.t") == []
+    assert bq.column_costs("p.d.t")["columns"] == []
     seed([], [])
     with pytest.raises(MissingTable):
         bq.column_costs("p.d.t")
@@ -232,7 +313,9 @@ def test_preview_never_falls_back_to_query(monkeypatch):
     c.get_table.side_effect=None
     c.get_table.return_value=remote_table()
     c.list_rows.return_value=[{"nested":{"when":dt.datetime(2026,1,1,tzinfo=dt.UTC),"bytes":b'\xff'}}]
-    assert bq.preview("p.d.t",5)==[{"nested":{"when":"2026-01-01T00:00:00+00:00","bytes":"/w=="}}]
+    out=bq.preview("p.d.t",5)
+    assert out["rows"]==[{"nested":{"when":"2026-01-01T00:00:00+00:00","bytes":"/w=="}}]
+    assert out["receipt"]["call"]=="tables.get, tabledata.list" and out["receipt"]["jobs_created"]==0
     c.list_rows.assert_called_once_with(c.get_table.return_value,max_results=5)
     for kind in ["VIEW","EXTERNAL","MATERIALIZED_VIEW"]:
         c.get_table.return_value=remote_table(type=kind)
@@ -351,3 +434,10 @@ def test_denied_routines_keep_tables(monkeypatch):
         assert catalog.describe(con, "p.d.t")["fqn"] == "p.d.t"
         d = catalog.describe_dataset(con, "p.d")
     assert d["routines_status"] == "denied" and d["routines"] == []
+
+
+def test_harvest_returns_a_receipt_of_free_calls(monkeypatch):
+    fake_client(monkeypatch, [remote_table("a"), remote_table("b")], [remote_routine()])
+    receipt = bq.harvest(["p.d"])
+    assert receipt["jobs_created"] == 0 and receipt["free"] is True
+    assert receipt["get_calls"] == {"datasets.get": 1, "tables.get": 2, "routines.get": 1}

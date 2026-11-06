@@ -140,10 +140,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(bq.preview(body.get("fqn", ""), 10))
             if path == "/api/column-costs":
                 fqn = body.get("fqn", "")
-                bq.column_costs(fqn)
+                receipt = bq.column_costs(fqn)["receipt"]
                 with catalog.connect() as con:
                     result = catalog.describe(con, fqn)
-                return self._json(result)
+                return self._json(result | {"receipt": receipt})
+            if path == "/api/cost-report":
+                return self._json(bq.cost_report(body.get("hours", 24)))
             self._json({"error": "Not found."}, 404)
         except Exception as error:
             self._error(error)

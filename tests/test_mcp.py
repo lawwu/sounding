@@ -15,7 +15,8 @@ def test_tool_schemas_and_bounds(monkeypatch):
     async def check():
         app=create_server()
         schemas={t.name:t.input_schema for t in await app.list_tools()}
-        assert {"describe_dataset","search_routines","describe_routine"} <= set(schemas)
+        assert {"describe_dataset","search_routines","describe_routine","cost_report"} <= set(schemas)
+        assert schemas["cost_report"]["properties"]["hours"]["maximum"]==bq.COST_REPORT_MAX_HOURS
         assert schemas["search_routines"]["properties"]["limit"]["maximum"]==100
         n=schemas["preview_rows"]["properties"]["n"]
         assert n["minimum"]==1 and n["maximum"]==50

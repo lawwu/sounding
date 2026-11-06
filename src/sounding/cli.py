@@ -9,6 +9,7 @@
   sounding column-costs <project.dataset.table>   # one free dry run per column
   sounding estimate "<sql>"            # free dry run
   sounding preview <project.dataset.table>        # free tabledata.list
+  sounding cost-report [--hours 24]    # jobs this identity ran in the job project, with billed bytes
   sounding mcp                         # stdio MCP server for agents
   sounding ui [--port 8765] [--open]   # local search UI
 """
@@ -17,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 
 
 def _main() -> None:
@@ -32,6 +34,8 @@ def _main() -> None:
     sub.add_parser("column-costs", help="per-column scan bytes via dry runs").add_argument("table")
     sub.add_parser("estimate", help="dry-run a query").add_argument("sql")
     sub.add_parser("preview", help="sample rows via tabledata.list").add_argument("table")
+    report = sub.add_parser("cost-report", help="jobs run in the job project and what BigQuery billed (free)")
+    report.add_argument("--hours", type=int, default=24, help="window to report, up to 4320 (180 days)")
     sub.add_parser("mcp", help="run the stdio MCP server")
     ui = sub.add_parser("ui", help="run the local search UI")
     ui.add_argument("--port", type=int, default=8765)
@@ -47,7 +51,7 @@ def _main() -> None:
         return serve_ui(a.port, a.open)
     from . import bq, catalog
     if a.cmd == "harvest":
-        bq.harvest(a.datasets)
+        print(_receipt_line(bq.harvest(a.datasets)), file=sys.stderr)
     elif a.cmd == "show":
         offset = 0
         while offset is not None:
@@ -76,13 +80,27 @@ def _main() -> None:
         with catalog.connect() as con:
             print(json.dumps(catalog.describe_routine(con, a.routine), indent=2))
     elif a.cmd == "column-costs":
-        for col, b in sorted(bq.column_costs(a.table), key=lambda x: -(x[1] or 0)):
+        result = bq.column_costs(a.table)
+        for col, b in sorted(result["columns"], key=lambda x: -(x[1] or 0)):
             size = "unknown" if b is None else f"{b / 1e6:.2f} MB"
             print(f"{size:>14}  {col}")
+        print(_receipt_line(result["receipt"]), file=sys.stderr)
     elif a.cmd == "estimate":
         print(json.dumps(bq.dry_run(a.sql), indent=2))
     elif a.cmd == "preview":
         print(json.dumps(bq.preview(a.table), indent=2, default=str))
+    elif a.cmd == "cost-report":
+        print(json.dumps(bq.cost_report(a.hours), indent=2))
+
+
+def _receipt_line(r: dict) -> str:
+    if "calls" in r:  # combined dry runs
+        billed = "unknown" if r["billed_bytes"] is None else f"{r['billed_bytes']} bytes"
+        verdict = "free" if r["free"] else "NOT CONFIRMED FREE"
+        return (f"receipt: {r['calls']} dry runs, BigQuery billed {billed}, dry run confirmed: "
+                f"{r['dry_run_confirmed']}, jobs created: {r['jobs_created']} ({verdict})")
+    gets = ", ".join(f"{n} {call}" for call, n in r.get("get_calls", {}).items())
+    return f"receipt: free API calls{' (' + gets + ')' if gets else ''}; no jobs created"
 
 
 def main() -> None:
