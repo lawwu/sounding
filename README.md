@@ -222,6 +222,26 @@ and the Python MCP SDK is the reference implementation.
 6. Opt-in billed profiling behind a byte cap and approval, with results cached in the catalog
 7. ✅ Keep the whole table resource (keys, partition guidance, storage, labels, policy tags), dataset settings and routines; next: BigQuery ML models, row-access policy metadata, and opt-in job history
 
+## Stability
+
+Sounding follows [semantic versioning](https://semver.org). While the version is 0.x,
+any minor release may break things, and its release notes say so when it does. From
+1.0.0, these are the public interface, and breaking any of them needs a major version:
+
+- **CLI:** command names, flags, and the JSON that commands print. New fields may be
+  added to that JSON at any time, so parse it by key rather than by position.
+- **MCP tools:** tool names, their inputs, and their result shapes, with the same
+  allowance for added fields.
+- **The catalog file:** every 1.x release opens and upgrades every 1.x catalog in place.
+  Query it through Sounding; its table layout is not part of the interface.
+- **The cost contract:** Sounding makes only free BigQuery calls, every call that reaches
+  BigQuery reports a receipt, and an unknown cost is reported as unknown, never as zero.
+
+**The Python modules are internal.** `sounding.bq`, `sounding.catalog`, `sounding.ui`,
+`sounding.mcp_server` and the rest may change in any release, including patch releases,
+without notice. Use the CLI or the MCP server instead. If you need to drive Sounding from
+Python, open an issue: a small public API can be designed for that.
+
 ## Development
 
 ```bash
