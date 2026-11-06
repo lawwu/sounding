@@ -185,7 +185,7 @@ def test_v2_catalog_is_upgraded_in_place(tmp_path, capsys):
         d = catalog.describe_dataset(con, "p.d")
         assert catalog.stats(con) | {"harvested_at": None} == {
             "datasets": 1, "tables": 1, "bytes": 100, "harvested_at": None, "routines": 0}
-    assert "upgraded the catalog to schema 3" in capsys.readouterr().err
+    assert "upgraded the catalog to schema 4" in capsys.readouterr().err
     assert list(tmp_path.glob("v2.v*")) == []  # upgraded, not moved aside
     assert t["num_rows"] == 5 and t["columns"][0]["path"] == "id"
     assert t["storage"] is None and t["labels"] is None and t["columns"][0]["policy_tags"] is None
