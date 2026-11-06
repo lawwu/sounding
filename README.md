@@ -67,9 +67,14 @@ uv run sounding cost-report --hours 24        # what this identity was billed, w
 
 The catalog lives at `~/.sounding/catalog.duckdb`. Set `SOUNDING_CATALOG` to put it elsewhere.
 
+Harvest crawls up to 4 datasets at once, each fetching up to 16 tables or routines
+at once, and column costs run up to 16 dry runs at once. In a terminal both show a
+progress bar on stderr; its total grows as list calls reveal how many tables there
+are. Piped output gets plain per-dataset lines.
+
 Each dataset publishes a complete snapshot in one transaction. A failed dataset
-crawl leaves its previous snapshot current; earlier datasets in the same command
-remain committed. Dataset aliases are normalized to `project.dataset`. Snapshot IDs
+crawl leaves its previous snapshot current; the other datasets in the same command
+still finish and stay committed, and the command then exits with the first error. Dataset aliases are normalized to `project.dataset`. Snapshot IDs
 are unique and allocated during the write transaction. Timestamps are stored as
 absolute instants and returned in UTC with an explicit offset.
 
