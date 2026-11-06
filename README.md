@@ -19,6 +19,7 @@ Sounding answers each question from the cheapest source that can.
 | REST `routines.list` / `routines.get` | Functions and procedures: type, language, signature, return type, description, body | $0 (API quota) |
 | `tabledata.list` | Sample rows (tables only, not views) | $0 |
 | Dry run | Estimated bytes, reported referenced tables, and estimate limitations | $0 |
+| REST `jobs.list` | Jobs this identity ran in the job project, with what BigQuery billed (`sounding cost-report`) | $0 (API quota) |
 | INFORMATION_SCHEMA | Per-partition details, job history | 10 MB minimum for on-demand queries; capacity queries consume slots; never cached: **not harvested** (the cost guard can still dry-run it for free) |
 | Sampled profiles | `TABLESAMPLE` + `APPROX_*` | Billed: **not used yet** (planned as opt-in, capped, approved) |
 
@@ -61,6 +62,7 @@ uv run sounding describe bigquery-public-data.thelook_ecommerce.orders
 uv run sounding column-costs bigquery-public-data.thelook_ecommerce.order_items
 uv run sounding estimate 'SELECT * FROM `bigquery-public-data.stackoverflow.posts_questions`'
 uv run sounding preview bigquery-public-data.thelook_ecommerce.orders
+uv run sounding cost-report --hours 24        # what this identity was billed, with evidence
 ```
 
 The catalog lives at `~/.sounding/catalog.duckdb`. Set `SOUNDING_CATALOG` to put it elsewhere.
@@ -77,6 +79,29 @@ network calls, so UI and MCP reads can continue during those calls. Operations m
 wait up to 10 seconds for another local operation, then return a retryable error.
 Keep the catalog on a local filesystem; external DuckDB programs do not participate
 in this coordination and must close their connections before Sounding opens it.
+
+### Cost receipts
+
+Every action that calls BigQuery returns a `receipt` showing it cost nothing, and
+`sounding cost-report` shows the jobs this identity ran in the job project, with what was billed.
+
+- **Dry runs** (estimate, cost guard, column costs): the receipt copies three fields
+  from BigQuery's own response. `dry_run_confirmed` is `configuration.dryRun`,
+  `billed_bytes` is `statistics.query.totalBytesBilled` (0), and `job_id` is null
+  because no job is created. If any of them says otherwise, `free` is false and the
+  estimate carries a warning.
+- **Metadata calls and previews** (harvest, `tabledata.list`): these are not jobs, and
+  BigQuery returns no billing fields for them. Their receipt names the calls made and
+  points to [Google's list of free operations](https://cloud.google.com/bigquery/pricing#free).
+- **`sounding cost-report`** lists the jobs this identity ran in the job project over
+  a window: 24 hours by default, up to the 180 days BigQuery keeps. It uses the free
+  `jobs.list` call and shows each job's billed bytes and list price.
+  - None of Sounding's calls creates a job, so a window in which you only used
+    Sounding shows **0 jobs**. That is evidence nothing in it could have been billed
+    to that project.
+  - A query run by any other tool in that project appears with its own billed bytes.
+  - It does not show jobs billed to other projects or by other identities, and it
+    prices at list rate, so your Cloud Billing report remains the final word.
 
 ### What a harvest keeps
 
@@ -131,7 +156,7 @@ uv run sounding ui --open      # http://127.0.0.1:8765, localhost only
 The page has live search over table names, column paths and descriptions, and reports which
 columns matched. Pick a table to see its size, freshness, full-scan cost, and nested schema,
 plus notes, labels, declared keys, storage, and which columns have policy tags.
-Each table page has three free actions:
+The **Cost report** button lists jobs run in the job project over a chosen window, with their billed bytes. Each table page has three free actions, and each one shows its receipt:
 - **Column costs:** one dry run per column, drawn as bars.
 - **Preview:** 10 rows via `tabledata.list`.
 - **Cost guard:** paste SQL and see the bytes and dollars it would scan, without running it.
@@ -154,7 +179,7 @@ discarded when the selection changes, and catalog text is escaped before display
 | Tool | Calls BigQuery? |
 | --- | --- |
 | `search_catalog`, `describe_table`, `describe_dataset`, `search_routines`, `describe_routine` | Never |
-| `preview_rows`, `estimate_query_cost` | Yes, free calls only |
+| `preview_rows`, `estimate_query_cost`, `cost_report` | Yes, free calls only; each result carries a receipt or job list |
 
 `search_catalog(q="", limit=50, offset=0)` returns `{items, next_offset}`; pass
 `next_offset` as `offset` to continue. Limits are 1–100 tables and 20 matching paths
@@ -163,7 +188,7 @@ excerpts; `describe_table` returns the full schema and descriptions. Paging refl
 the latest catalog at each request, so a concurrent harvest can change page contents.
 `search_routines` pages the same way and returns 1000-character body excerpts;
 `describe_routine` returns the whole body, and `describe_dataset` lists signatures only.
-`preview_rows` accepts 1–50 rows and rejects views/external tables without querying
+`preview_rows` returns `{rows, receipt}`, accepts 1–50 rows and rejects views/external tables without querying
 them. Tool failures use MCP protocol errors, with credential and filesystem details
 removed. For estimates, agents must inspect `estimate_status`, `warnings`,
 `usd_on_demand_range`, and `referenced_tables_complete`, rather than interpreting

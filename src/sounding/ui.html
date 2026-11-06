@@ -82,6 +82,10 @@
              border: 1px solid var(--line); background: var(--panel); color: var(--ink); resize: vertical; }
   .est { margin-top: 8px; font-size: 13px; }
   .est .big { font-size: 18px; font-weight: 600; }
+  .receipt { margin: 6px 0; font-size: 12px; color: var(--free); }
+  .receipt.unconfirmed { color: var(--warn); }
+  .receipt code { font-family: var(--mono); font-size: 11px; }
+  .report-total { font-size: 18px; font-weight: 600; margin: 12px 0 4px; }
   .err { color: var(--bad); font-size: 12px; white-space: pre-wrap; }
   .hint { color: var(--muted); font-size: 12px; font-weight: 400; text-transform: none; letter-spacing: 0; }
   @media (max-width: 760px) {
@@ -96,6 +100,7 @@
   <h1>Sounding<span>BigQuery catalog</span></h1>
   <input id="q" type="search" placeholder="Search tables, columns, descriptions…  (/ to focus)" autofocus autocomplete="off">
   <div id="stats"></div>
+  <button id="report" title="Jobs this identity ran in the job project, with what BigQuery billed (free jobs.list call)">Cost report</button>
 </header>
 <main>
   <section id="results"><div id="count"></div><div id="list"></div><button id="more" hidden>Load more</button></section>

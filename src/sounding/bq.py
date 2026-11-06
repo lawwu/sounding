@@ -1,4 +1,4 @@
-"""The only module that calls BigQuery: metadata (datasets, tables, routines), dry runs, and tabledata.list only.
+"""The only module that calls BigQuery: metadata (datasets, tables, routines), dry runs, tabledata.list and jobs.list only.
 
 No billed queries or Storage Read API calls are made, and the harvester never reads
 INFORMATION_SCHEMA. User SQL, INFORMATION_SCHEMA included, is only ever dry-run.
@@ -24,6 +24,9 @@ JOB_PROJECT = os.environ.get("SOUNDING_JOB_PROJECT")
 GET_TABLE_WORKERS = 16
 MAX_SQL_LENGTH = 100_000
 PRICE_BASIS = "US on-demand scan list price ($6.25/TiB); excludes free tier, discounts and other services."
+PRICING_DOC = "https://cloud.google.com/bigquery/pricing#free"
+COST_REPORT_MAX_HOURS = 180 * 24  # BigQuery keeps job history for 180 days
+COST_REPORT_MAX_JOBS = 1000
 
 
 def client() -> bigquery.Client:
@@ -156,12 +159,16 @@ def routine_record(r: dict, dataset: str) -> dict:
             "resource": {k: v for k, v in r.items() if k not in ROUTINE_DROP}}
 
 
-def harvest(datasets: list[str]) -> None:
-    """Free metadata calls only: datasets.get, tables.list/get and routines.list/get."""
+def harvest(datasets: list[str]) -> dict:
+    """Free metadata calls only: datasets.get, tables.list/get and routines.list/get.
+
+    Returns a receipt counting the get calls made. None of them is a job.
+    """
     # Fail early on unsupported catalogs, but release the connection before network I/O.
     with catalog.connect():
         pass
     c = client()
+    counts = {"datasets.get": 0, "tables.get": 0, "routines.get": 0}
     for raw_ds in datasets:
         text(raw_ds, "dataset")
         try:
@@ -191,6 +198,48 @@ def harvest(datasets: list[str]) -> None:
         extra = f", {len(routine_rows)} routines" if routines_status == "harvested" else ", routines denied"
         print(f"{ds}: {len(fetched)} tables, {len(col_rows)} column paths{extra} (snapshot {sid})",
               file=sys.stderr)
+        counts["datasets.get"] += 1
+        counts["tables.get"] += len(fetched)
+        counts["routines.get"] += len(routines)
+    return free_api_receipt("datasets.get", "tables.list", "tables.get", "routines.list", "routines.get") | {"get_calls": counts}
+
+
+def dry_run_receipt(job) -> dict:
+    """Evidence that a dry run cost nothing, copied from BigQuery's own response.
+
+    google-cloud-bigquery replaces a job's properties with the server's response, so
+    these fields are what BigQuery returned, not what Sounding sent. A dry run comes
+    back with configuration.dryRun true, statistics.query.totalBytesBilled "0" and no
+    job ID, because no job is created. Anything else is reported, never smoothed over.
+    """
+    props = job._properties
+    billed = props.get("statistics", {}).get("query", {}).get("totalBytesBilled")
+    receipt = {"call": "jobs.insert (dry run)",
+               "dry_run_confirmed": props.get("configuration", {}).get("dryRun") is True,
+               "billed_bytes": None if billed is None else int(billed),
+               "job_id": props.get("jobReference", {}).get("jobId"),
+               "job_project": props.get("jobReference", {}).get("projectId"),
+               "source": "BigQuery's response: configuration.dryRun, statistics.query.totalBytesBilled, jobReference.jobId"}
+    receipt["free"] = receipt["dry_run_confirmed"] and receipt["billed_bytes"] == 0 and receipt["job_id"] is None
+    return receipt
+
+
+def combine_receipts(receipts: list[dict]) -> dict:
+    """One receipt for several dry runs, such as a table's column costs."""
+    billed = [r.get("billed_bytes") for r in receipts]
+    return {"call": "jobs.insert (dry run)", "calls": len(receipts),
+            "dry_run_confirmed": all(r.get("dry_run_confirmed") is True for r in receipts),
+            "billed_bytes": None if None in billed else sum(billed),
+            "jobs_created": sum(1 for r in receipts if r.get("job_id")),
+            "free": all(r.get("free") is True for r in receipts),
+            "source": "BigQuery's response to each dry run"}
+
+
+def free_api_receipt(*calls: str) -> dict:
+    """Metadata and tabledata.list calls are not jobs, and BigQuery returns no billing fields for them."""
+    return {"call": ", ".join(calls), "jobs_created": 0, "free": True,
+            "source": f"Not a job: BigQuery lists these calls as free ({PRICING_DOC}) and returns no "
+                      "billing fields for them. `sounding cost-report` shows any job a project ran."}
 
 
 def dry_run(sql: str) -> dict:
@@ -198,6 +247,7 @@ def dry_run(sql: str) -> dict:
     # Every statement, INFORMATION_SCHEMA included, is submitted only as a dry run, which
     # BigQuery never bills or executes; test_every_query_is_serialized_as_a_dry_run guards it.
     job = client().query(sql, job_config=bigquery.QueryJobConfig(dry_run=True, use_query_cache=False))
+    receipt = dry_run_receipt(job)
     reported = job.total_bytes_processed
     stats = job._properties.get("statistics", {}).get("query", {})
     accuracy = _accuracy(stats)
@@ -223,12 +273,14 @@ def dry_run(sql: str) -> dict:
         warnings.append("A scan-price range is unavailable because the referenced-table list may be incomplete.")
     if price and len(refs) > 1:
         warnings.append("Price is a range: the dry run does not report each table's share of billable bytes.")
+    if not receipt["free"]:
+        warnings.append("BigQuery's response did not confirm a free dry run (see receipt). Check `sounding cost-report`.")
     return {"bytes": reported if reliable else None, "reported_bytes": reported,
             "estimate_status": ("upper_bound" if accuracy == "UPPER_BOUND" else "estimated") if reliable else "unknown",
             "usd_on_demand": price["max"] if price and price["min"] == price["max"] else None,
             "usd_on_demand_range": price, "price_basis": PRICE_BASIS,
             "referenced_tables": refs, "referenced_tables_complete": complete_refs and reliable,
-            "warnings": warnings, "source": "dry run (free; never executes SQL)"}
+            "warnings": warnings, "source": "dry run (free; never executes SQL)", "receipt": receipt}
 
 
 def _accuracy(stats: dict) -> str | None:
@@ -252,15 +304,19 @@ def quote_identifier(name: str) -> str:
     return "`" + name.replace("\\", "\\\\").replace("`", "\\`") + "`"
 
 
-def column_costs(fqn: str) -> list[tuple[str, int | None]]:
-    """Compute outside the lock, then atomically cache only against the unchanged current snapshot."""
+def column_costs(fqn: str) -> dict:
+    """Compute outside the lock, then atomically cache only against the unchanged current snapshot.
+
+    Returns {"columns": [(path, bytes)], "receipt": ...}, the receipt covering every dry run.
+    """
     with catalog.connect() as con:
         table = catalog.describe(con, fqn)
     if table["type"] != "TABLE":
         raise SoundingError("Column costs require a native table.")
     cols = [c["path"] for c in table["columns"] if "." not in c["path"]]
-    out = [(col, dry_run(f"SELECT sounding_source.{quote_identifier(col)} FROM {quote_identifier(fqn)} AS sounding_source")["bytes"])
-           for col in cols]
+    runs = [(col, dry_run(f"SELECT sounding_source.{quote_identifier(col)} FROM {quote_identifier(fqn)} AS sounding_source"))
+            for col in cols]
+    out = [(col, r["bytes"]) for col, r in runs]
     with catalog.connect(write=True) as con:
         if catalog.describe(con, fqn)["snapshot_id"] != table["snapshot_id"]:
             raise SoundingError("The catalog changed while estimating columns. Retry against the new snapshot.")
@@ -273,7 +329,7 @@ def column_costs(fqn: str) -> list[tuple[str, int | None]]:
         except BaseException:
             con.execute("ROLLBACK")
             raise
-    return out
+    return {"columns": out, "receipt": combine_receipts([r.get("receipt", {}) for _, r in runs])}
 
 
 def _json_value(value):
@@ -290,11 +346,60 @@ def _json_value(value):
     return value
 
 
-def preview(fqn: str, n: int = 5) -> list[dict]:
+def preview(fqn: str, n: int = 5) -> dict:
     text(fqn, "table")
     integer(n, "n", 1, 50)
     c = client()
     table = c.get_table(fqn)
     if table.table_type not in ("TABLE", "SNAPSHOT"):
         raise SoundingError("Preview supports native tables and snapshots only, not views or external tables.")
-    return [_json_value(dict(row.items())) for row in c.list_rows(table, max_results=n)]
+    rows = [_json_value(dict(row.items())) for row in c.list_rows(table, max_results=n)]
+    return {"rows": rows, "receipt": free_api_receipt("tables.get", "tabledata.list")}
+
+
+def _iso(when: dt.datetime | None) -> str | None:
+    return None if when is None else when.astimezone(dt.UTC).isoformat()
+
+
+def cost_report(hours: int = 24) -> dict:
+    """Every job your identity ran in the job project over the window, with BigQuery's billed bytes.
+
+    jobs.list is free. Dry runs, metadata calls and tabledata.list never create jobs, so
+    a Sounding-only window lists none; any billable query, from any tool, appears here
+    with its own statistics.query.totalBytesBilled. Billing reports remain the final word.
+    """
+    integer(hours, "hours", 1, COST_REPORT_MAX_HOURS)
+    c = client()
+    now = dt.datetime.now(dt.UTC)
+    since = now - dt.timedelta(hours=hours)
+    jobs = list(c.list_jobs(min_creation_time=since, max_results=COST_REPORT_MAX_JOBS + 1))
+    truncated = len(jobs) > COST_REPORT_MAX_JOBS
+    rows = []
+    for job in jobs[:COST_REPORT_MAX_JOBS]:
+        stats = job._properties.get("statistics", {})
+        query = stats.get("query", {})
+        billed = query.get("totalBytesBilled")
+        rows.append({"job_id": job.job_id, "type": job.job_type, "state": job.state,
+                     "created": _iso(job.created), "statement_type": query.get("statementType"),
+                     "billed_bytes": None if billed is None else int(billed),
+                     "cache_hit": query.get("cacheHit"), "slot_ms": _int(stats.get("totalSlotMs")),
+                     "usd_on_demand": None if billed is None else catalog.usd(int(billed))})
+    query_rows = [r for r in rows if r["type"] == "query"]
+    unknown = [r for r in query_rows if r["billed_bytes"] is None]
+    billed_total = None if unknown else sum(r["billed_bytes"] for r in query_rows)
+    warnings = []
+    if truncated:
+        warnings.append(f"More than {COST_REPORT_MAX_JOBS} jobs; only the newest are listed. Use a shorter window.")
+    if unknown:
+        warnings.append("Some query jobs have no billed bytes yet (still running or failed early); the total is unknown.")
+    if any(r["type"] != "query" for r in rows):
+        warnings.append("Load, copy and extract jobs are listed but not priced here.")
+    if any(r["slot_ms"] for r in query_rows):
+        warnings.append("Under capacity (slot) pricing, cost follows slot usage, not billed bytes.")
+    return {"project": c.project, "since": since.isoformat(), "until": now.isoformat(), "hours": hours,
+            "job_count": len(rows), "query_jobs": len(query_rows), "billed_bytes": billed_total,
+            "usd_on_demand": None if billed_total is None else catalog.usd(billed_total),
+            "price_basis": PRICE_BASIS, "jobs": rows, "truncated": truncated, "warnings": warnings,
+            "source": "BigQuery jobs.list (free) for jobs your identity ran in this project. Dry runs, "
+                      "metadata calls and previews never create jobs, so they never appear. Jobs billed "
+                      "to other projects are not shown; your billing report is the final word."}

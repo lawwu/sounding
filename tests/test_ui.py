@@ -70,10 +70,10 @@ def test_duplicate_host_is_rejected(server):
     con.close()
 
 
-@pytest.mark.parametrize("path,body",[("/api/estimate",{"sql":"SELECT 1"}),("/api/column-costs",{"fqn":"p.d.orders"}),("/api/preview",{"fqn":"p.d.orders"})])
+@pytest.mark.parametrize("path,body",[("/api/estimate",{"sql":"SELECT 1"}),("/api/column-costs",{"fqn":"p.d.orders"}),("/api/preview",{"fqn":"p.d.orders"}),("/api/cost-report",{"hours":24})])
 def test_simple_cross_origin_posts_never_invoke_bigquery(server,monkeypatch,path,body):
     action=Mock(side_effect=AssertionError("must reject before dispatch"))
-    for name in ["dry_run","column_costs","preview"]: monkeypatch.setattr(bq,name,action)
+    for name in ["dry_run","column_costs","preview","cost_report"]: monkeypatch.setattr(bq,name,action)
     headers={"Origin":"https://attacker.invalid","Content-Type":"text/plain","Sec-Fetch-Site":"cross-site"}
     assert request(server,path,"POST",json.dumps(body),headers,authorized=False)[0]==403
     # Even a known token does not permit a hostile origin or a simple content type.
@@ -92,9 +92,11 @@ def test_api_requires_token_and_preview_is_post_only(server):
 
 def test_valid_actions_and_missing_table_errors(server,monkeypatch):
     monkeypatch.setattr(bq,"dry_run",lambda sql:{"bytes":123,"usd_on_demand":0.1})
-    monkeypatch.setattr(bq,"preview",lambda fqn,n:[{"id":1}])
+    monkeypatch.setattr(bq,"preview",lambda fqn,n:{"rows":[{"id":1}],"receipt":{}})
+    monkeypatch.setattr(bq,"cost_report",lambda hours:{"hours":hours,"job_count":0})
     assert json.loads(request(server,"/api/estimate","POST",json.dumps({"sql":"SELECT 1"}))[2])["bytes"]==123
-    assert json.loads(request(server,"/api/preview","POST",json.dumps({"fqn":"p.d.orders"}))[2])==[{"id":1}]
+    assert json.loads(request(server,"/api/preview","POST",json.dumps({"fqn":"p.d.orders"}))[2])["rows"]==[{"id":1}]
+    assert json.loads(request(server,"/api/cost-report","POST",json.dumps({"hours":168}))[2])=={"hours":168,"job_count":0}
     assert request(server,"/api/table?fqn=p.d.missing")[0]==404
     status,_,body=request(server,"/api/column-costs","POST",json.dumps({"fqn":"p.d.missing"}))
     assert status==404 and "error" in json.loads(body)

@@ -18,6 +18,17 @@ async function api(path, body) {
   const j = await r.json(); if (!r.ok || j.error) throw new Error(j.error || r.statusText); return j;
 }
 
+// A receipt is evidence copied from BigQuery's response (dry runs) or the call type (free API calls).
+function receiptHtml(r) {
+  if (!r) return "";
+  if (r.call.startsWith("jobs.insert")) {
+    const n = r.calls ? `${r.calls} dry runs · ` : "";
+    const jobs = r.calls ? `${r.jobs_created} jobs created` : (r.job_id ? `job ${esc(r.job_id)} created` : "no job created");
+    return `<div class="receipt${r.free ? "" : " unconfirmed"}" title="${esc(r.source)}">${r.free ? "✓" : "⚠"} Receipt from BigQuery: ${n}dry run ${r.dry_run_confirmed ? "confirmed" : "NOT confirmed"} · billed ${r.billed_bytes == null ? "unknown" : bytes(r.billed_bytes)} · ${jobs}</div>`;
+  }
+  return `<div class="receipt" title="${esc(r.source)}">✓ Receipt: <code>${esc(r.call)}</code> · free API calls, no job created</div>`;
+}
+
 let current = null, seq = 0, viewSeq = 0, renderSeq = 0, estimateSeq = 0;
 let nextOffset = null, displayed = 0;
 
@@ -110,6 +121,7 @@ function renderTable(t) {
 
     <h3>Schema <span class="hint">${t.columns.length} column paths</span>
       ${t.type === "TABLE" ? `<button id="costs">${hasCosts ? "Refresh" : "Compute"} column costs</button><span class="hint">one free dry run per top-level column</span>` : ""}</h3>
+    ${receiptHtml(t.receipt)}
     <table><thead><tr><th>Column</th><th>Type</th><th>Mode</th><th>Scan cost</th>${hasDesc ? "<th>Description</th>" : ""}</tr></thead><tbody>
     ${t.columns.map(c => {
       const parts = c.path.split("."), leaf = parts.pop();
@@ -138,12 +150,13 @@ function renderTable(t) {
   if ($("#prev")) $("#prev").onclick = async e => {
     e.target.disabled = true;
     try {
-      const rows = await api("/api/preview", {fqn: t.fqn});
+      const res = await api("/api/preview", {fqn: t.fqn}), rows = res.rows;
       if (!active()) return;
       const keys = Object.keys(rows[0] || {});
       const cell = v => esc(typeof v === "object" && v !== null ? JSON.stringify(v) : v);
       $("#prevout").innerHTML = rows.length ? `<div class="scroll"><table><thead><tr>${keys.map(k => `<th>${esc(k)}</th>`).join("")}</tr></thead>
         <tbody>${rows.map(r => `<tr>${keys.map(k => `<td title="${cell(r[k])}">${cell(r[k])}</td>`).join("")}</tr>`).join("")}</tbody></table></div>` : `<div class="empty">No rows.</div>`;
+      $("#prevout").insertAdjacentHTML("beforeend", receiptHtml(res.receipt));
     } catch (err) { if (active()) $("#prevout").innerHTML = `<div class="err">${esc(err.message)}</div>`; }
     if (active()) e.target.disabled = false;
   };
@@ -161,7 +174,7 @@ async function estimate() {
     out.innerHTML = `<span class="big num">${r.bytes == null ? "Unknown scan size" : bytes(r.bytes)}</span> · ${esc(r.estimate_status)} · <b>${cost}</b>
       <span class="chip free">dry run · free</span><br><span class="hint">${esc(r.price_basis)}<br>
       Reported tables${r.referenced_tables_complete ? "" : " (may be incomplete)"}: ${r.referenced_tables.map(esc).join(", ") || "none reported"}<br>
-      ${r.warnings.map(esc).join("<br>")}</span>`;
+      ${r.warnings.map(esc).join("<br>")}</span>${receiptHtml(r.receipt)}`;
   } catch (err) { if (active()) out.innerHTML = `<div class="err">${esc(err.message)}</div>`; }
 }
 
@@ -176,7 +189,30 @@ async function open(fqn) {
   catch (err) { if (my === viewSeq) $("#detail").innerHTML = `<div class="err">${esc(err.message)}</div>`; }
 }
 
+async function costReport(hours = 24) {
+  const my = ++viewSeq;
+  ++renderSeq;
+  current = null;
+  document.querySelectorAll(".r.sel").forEach(el => el.classList.remove("sel"));
+  $("#detail").textContent = "Listing jobs…";
+  try {
+    const r = await api("/api/cost-report", {hours});
+    if (my !== viewSeq) return;
+    const windows = [[24, "24 hours"], [168, "7 days"], [720, "30 days"], [4320, "180 days"]];
+    $("#detail").innerHTML = `<h2>Cost report · ${esc(r.project)}</h2>
+      <div class="chips">${windows.map(([h, label]) => `<button data-hours="${h}"${h === r.hours ? " disabled" : ""}>${label}</button>`).join("")}</div>
+      <div class="report-total num">${r.job_count} jobs · ${r.billed_bytes == null ? "billed bytes unknown" : `${bytes(r.billed_bytes)} billed`} · ${usd(r.usd_on_demand)}</div>
+      <div class="hint">${esc(new Date(r.since).toLocaleString())} – ${esc(new Date(r.until).toLocaleString())}<br>${esc(r.source)}<br>${esc(r.price_basis)}${r.warnings.length ? "<br>" + r.warnings.map(esc).join("<br>") : ""}</div>
+      ${r.jobs.length ? `<h3>Jobs</h3><div class="scroll"><table><thead><tr><th>Created</th><th>Job</th><th>Type</th><th>State</th><th>Billed</th><th>List price</th><th>Cache</th></tr></thead><tbody>
+        ${r.jobs.map(j => `<tr><td>${esc(new Date(j.created).toLocaleString())}</td><td class="path">${esc(j.job_id)}</td><td>${esc(j.statement_type || j.type)}</td><td>${esc(j.state)}</td>
+          <td class="num">${bytes(j.billed_bytes)}</td><td class="num">${usd(j.usd_on_demand)}</td><td>${j.cache_hit ? "hit" : ""}</td></tr>`).join("")}</tbody></table></div>`
+        : `<div class="receipt">✓ No jobs: nothing you ran in this project during this window could have been billed.</div>`}`;
+    $("#detail").querySelectorAll("[data-hours]").forEach(b => b.onclick = () => costReport(Number(b.dataset.hours)));
+  } catch (err) { if (my === viewSeq) $("#detail").innerHTML = `<div class="err">${esc(err.message)}</div>`; }
+}
+
 let timer;
+$("#report").onclick = () => costReport();
 $("#q").addEventListener("input", () => { ++seq; nextOffset = null; $("#more").hidden = true; clearTimeout(timer); timer = setTimeout(search, 150); });
 $("#more").onclick = () => { if (nextOffset != null) search(nextOffset); };
 $("#list").addEventListener("click", e => { const r = e.target.closest(".r"); if (r) open(r.dataset.fqn); });

@@ -79,20 +79,29 @@ def create_server() -> MCPServer:
 
     @app.tool(description="1–50 sample rows via free tables.get and tabledata.list calls. "
               "Native tables and snapshots only; views/external tables are rejected, never queried. "
-              "BYTES are base64; decimal and temporal values are strings.")
+              "BYTES are base64; decimal and temporal values are strings. Returns rows and a receipt.")
     @tool_errors
     def preview_rows(table: Annotated[str, Field(min_length=1, max_length=2048)],
-                     n: Annotated[int, Field(ge=1, le=50)] = 5) -> list[dict]:
+                     n: Annotated[int, Field(ge=1, le=50)] = 5) -> dict:
         return bq.preview(table, n)
 
     @app.tool(description="Free dry run; SQL never executes. Returns estimated bytes and a US "
               "on-demand scan-price range including billing minimums. Unknown/incomplete estimates "
               "are null, never a promise of $0. Read estimate_status, warnings and price_basis. "
               "Scripts, dynamic SQL, external data and row security may be unestimated. "
-              "This is not a spending cap.")
+              "This is not a spending cap. `receipt` copies BigQuery's own evidence that the dry "
+              "run was free: dry_run_confirmed, billed_bytes (0) and job_id (null).")
     @tool_errors
     def estimate_query_cost(sql: Annotated[str, Field(min_length=1, max_length=bq.MAX_SQL_LENGTH)]) -> dict:
         return bq.dry_run(sql)
+
+    @app.tool(description="Jobs this identity ran in the job project over the last `hours` (default 24, "
+              "up to 4320), with BigQuery's billed bytes and an on-demand list-price total. Uses the free "
+              "jobs.list call. Sounding's own calls never create jobs, so a Sounding-only window shows "
+              "zero jobs. Use it to show what a session cost, with evidence; billing reports are final.")
+    @tool_errors
+    def cost_report(hours: Annotated[int, Field(ge=1, le=bq.COST_REPORT_MAX_HOURS)] = 24) -> dict:
+        return bq.cost_report(hours)
 
     return app
 
