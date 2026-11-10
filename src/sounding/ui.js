@@ -121,6 +121,7 @@ function renderTable(t) {
 
     <h3>Schema <span class="hint">${t.columns.length} column paths</span>
       ${t.type === "TABLE" ? `<button id="costs">${hasCosts ? "Refresh" : "Compute"} column costs</button><span class="hint">one free dry run per top-level column</span>` : ""}</h3>
+    ${(t.cost_warnings || []).map(w => `<p class="hint">${esc(w)}</p>`).join("")}
     ${receiptHtml(t.receipt)}
     <table><thead><tr><th>Column</th><th>Type</th><th>Mode</th><th>Scan cost</th>${hasDesc ? "<th>Description</th>" : ""}</tr></thead><tbody>
     ${t.columns.map(c => {

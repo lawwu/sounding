@@ -72,7 +72,13 @@ at once, and column costs run up to 16 dry runs at once. In a terminal both show
 progress bar on stderr; its total grows as list calls reveal how many tables there
 are. Piped output gets plain per-dataset lines.
 
-Each dataset publishes a complete snapshot in one transaction. A failed dataset
+Tables that require a partition filter get one in every column-cost dry run
+(`WHERE <partition column> IS NOT NULL`), and the partition column's own bytes are
+subtracted from each other column, so the costs stay per column. Rows in the NULL
+partition, if any, are not counted, and the command says so.
+
+Each dataset publishes a complete snapshot in one transaction A table or routine deleted between the list call and its get call is skipped
+with a log line. A failed dataset
 crawl leaves its previous snapshot current; the other datasets in the same command
 still finish and stay committed, and the command then exits with the first error. Dataset aliases are normalized to `project.dataset`. Snapshot IDs
 are unique and allocated during the write transaction. Timestamps are stored as

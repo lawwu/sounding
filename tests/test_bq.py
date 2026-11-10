@@ -507,3 +507,41 @@ def test_bad_dataset_name_fails_before_any_network_call(monkeypatch):
     with pytest.raises(SoundingError):
         bq.harvest(["p.ok", ""])
     c.get_dataset.assert_not_called()
+
+
+@pytest.mark.parametrize("partitioning,where", [
+    ("DAY:event_date", "WHERE sounding_source.`event_date` IS NOT NULL"),
+    ("DAY:_PARTITIONTIME", "WHERE _PARTITIONTIME IS NOT NULL")])
+def test_column_costs_satisfy_a_required_partition_filter(seed, monkeypatch, partitioning, where):
+    seed([table_row(partitioning=partitioning, require_partition_filter=True)],
+         [column_row("event_date"), column_row("title")])
+    calls = []
+    def dry(sql):
+        calls.append(sql)
+        return {"bytes": 30 if "`event_date` FROM" in sql else 100}  # every run also reads event_date
+    monkeypatch.setattr(bq, "dry_run", dry)
+    result = bq.column_costs("p.d.t")
+    assert all(sql.endswith(where) for sql in calls)
+    if partitioning.endswith("event_date"):  # the filter column's bytes are subtracted once
+        assert result["columns"] == [("event_date", 30), ("title", 70)]
+    else:  # pseudo-columns cost nothing
+        assert result["columns"] == [("event_date", 30), ("title", 100)]
+    assert "requires a partition filter" in result["warnings"][0]
+
+
+def test_unknown_partition_column_bytes_make_other_costs_unknown(seed, monkeypatch):
+    seed([table_row(partitioning="DAY:event_date", require_partition_filter=True)],
+         [column_row("event_date"), column_row("title")])
+    monkeypatch.setattr(bq, "dry_run", lambda sql: {"bytes": None if "`event_date` FROM" in sql else 100})
+    assert bq.column_costs("p.d.t")["columns"] == [("event_date", None), ("title", None)]
+
+
+def test_table_deleted_between_list_and_get_is_skipped(monkeypatch):
+    from google.api_core.exceptions import NotFound
+    gone = remote_table("gone")
+    c = fake_client(monkeypatch, [remote_table("kept"), gone])
+    c.get_table.side_effect = lambda ref: (_ for _ in ()).throw(NotFound("deleted")) if ref is gone else ref
+    receipt = bq.harvest(["p.d"])
+    assert receipt["get_calls"]["tables.get"] == 1
+    with catalog.connect() as con:
+        assert [r["table"] for r in catalog.search(con)["items"]] == ["p.d.kept"]
