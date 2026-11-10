@@ -75,7 +75,9 @@ def _main() -> None:
             with catalog.connect() as con:
                 page = catalog.search(con, a.q, offset=offset)
             for r in page["items"]:
-                print(f"{(r['bytes'] or 0) / 1e9:9.2f} GB  {r['rows'] or 0:>14,}  {r['type']:<6} {r['table']}")
+                size = "unknown" if r["bytes"] is None else f"{r['bytes'] / 1e9:.2f} GB"
+                rows = "unknown" if r["rows"] is None else f"{r['rows']:,}"
+                print(f"{size:>12}  {rows:>14}  {r['type']:<8} {r['table']}")
             offset = page["next_offset"]
     elif a.cmd == "describe":
         with catalog.connect() as con:
@@ -101,6 +103,8 @@ def _main() -> None:
         for col, b in sorted(result["columns"], key=lambda x: -(x[1] or 0)):
             size = "unknown" if b is None else f"{b / 1e6:.2f} MB"
             print(f"{size:>14}  {col}")
+        for warning in result["warnings"]:
+            print(f"note: {warning}", file=sys.stderr)
         print(_receipt_line(result["receipt"]), file=sys.stderr)
     elif a.cmd == "estimate":
         print(json.dumps(bq.dry_run(a.sql), indent=2))
@@ -153,7 +157,11 @@ def main() -> None:
     try:
         _main()
     except Exception as error:
-        message, _ = public_error(error)
+        message, status = public_error(error)
+        if status >= 500:
+            # The UI and MCP server keep internals out of responses; the CLI user is the
+            # operator, so name the underlying error instead of pointing at stderr.
+            message = f"{message.split('. See')[0]}: {type(error).__name__}: {error}"
         raise SystemExit(f"sounding: {message}") from None
 
 

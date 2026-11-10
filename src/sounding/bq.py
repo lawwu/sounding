@@ -15,7 +15,7 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
 
-from google.api_core.exceptions import Forbidden
+from google.api_core.exceptions import Forbidden, NotFound
 from google.cloud import bigquery
 
 from . import catalog
@@ -31,6 +31,7 @@ PRICE_BASIS = "US on-demand scan list price ($6.25/TiB); excludes free tier, dis
 PRICING_DOC = "https://cloud.google.com/bigquery/pricing#free"
 COST_REPORT_MAX_HOURS = 180 * 24  # BigQuery keeps job history for 180 days
 COST_REPORT_MAX_JOBS = 1000
+PSEUDO_PARTITION_COLUMNS = {"_PARTITIONTIME", "_PARTITIONDATE"}  # ingestion-time partitioning
 
 
 def client() -> bigquery.Client:
@@ -194,18 +195,26 @@ def harvest(datasets: list[str], progress: Quiet | None = None) -> dict:
         progress.add(len(table_refs))
         with ThreadPoolExecutor(GET_TABLE_WORKERS) as pool:
             def get_table(r):
-                t = c.get_table(r)
-                progress.advance()
-                return t
-            fetched = list(pool.map(get_table, table_refs))
+                try:
+                    return c.get_table(r)
+                except NotFound:  # deleted between tables.list and tables.get
+                    progress.log(f"{ds}: {r.table_id} disappeared during the harvest; skipped")
+                    return None
+                finally:
+                    progress.advance()
+            fetched = [t for t in pool.map(get_table, table_refs) if t is not None]
             try:
                 routine_refs = [i.reference for i in c.list_routines(ds)]
                 progress.add(len(routine_refs))
                 def get_routine(r):
-                    routine = c.get_routine(r)
-                    progress.advance()
-                    return routine
-                routines = list(pool.map(get_routine, routine_refs))
+                    try:
+                        return c.get_routine(r)
+                    except NotFound:
+                        progress.log(f"{ds}: routine {r.routine_id} disappeared during the harvest; skipped")
+                        return None
+                    finally:
+                        progress.advance()
+                routines = [r for r in pool.map(get_routine, routine_refs) if r is not None]
                 routines_status = "harvested"
             except Forbidden:
                 # Routine access is a separate permission; tables are still worth keeping.
@@ -351,18 +360,38 @@ def column_costs(fqn: str, progress: Quiet | None = None) -> dict:
     if table["type"] != "TABLE":
         raise SoundingError("Column costs require a native table.")
     cols = [c["path"] for c in table["columns"] if "." not in c["path"]]
+    source = f"FROM {quote_identifier(fqn)} AS sounding_source"
+    where, partition_col, warnings = "", None, []
+    if table.get("require_partition_filter") and table.get("partitioning"):
+        # BigQuery rejects queries on these tables without a partition filter. IS NOT NULL
+        # satisfies it and prunes only the NULL partition. A real partition column then
+        # adds its own bytes to every dry run, so they are measured once and subtracted.
+        column = table["partitioning"].split(":", 1)[1]
+        if column in PSEUDO_PARTITION_COLUMNS:
+            where = f" WHERE {column} IS NOT NULL"
+        else:
+            partition_col = column
+            where = f" WHERE sounding_source.{quote_identifier(column)} IS NOT NULL"
+        warnings.append(f"This table requires a partition filter, so each dry run filters on {column} IS NOT "
+                        "NULL; rows in the NULL partition, if any, are not counted.")
     progress = progress or Quiet()
-    progress.add(len(cols))
+    progress.add(len(cols) + (partition_col is not None and partition_col not in cols))
 
     def cost(col):
-        result = dry_run(f"SELECT sounding_source.{quote_identifier(col)} FROM {quote_identifier(fqn)} AS sounding_source")
+        result = dry_run(f"SELECT sounding_source.{quote_identifier(col)} {source}{where}")
         progress.advance()
         return col, result
 
+    targets = cols + ([partition_col] if partition_col is not None and partition_col not in cols else [])
     with ThreadPoolExecutor(DRY_RUN_WORKERS) as pool:  # map keeps column order; the first failure is raised
-        runs = list(pool.map(cost, cols))
+        runs = list(pool.map(cost, targets))
     progress.close()
-    out = [(col, r["bytes"]) for col, r in runs]
+    measured = dict((col, r["bytes"]) for col, r in runs)
+    base = measured.get(partition_col) if partition_col else 0
+    out = [(col, measured[col] if col == partition_col or measured[col] is None or base is None
+            else max(measured[col] - base, 0)) for col in cols]
+    if partition_col and base is None:
+        out = [(col, None if col != partition_col else b) for col, b in out]
     with catalog.connect(write=True) as con:
         if catalog.describe(con, fqn)["snapshot_id"] != table["snapshot_id"]:
             raise SoundingError("The catalog changed while estimating columns. Retry against the new snapshot.")
@@ -375,7 +404,8 @@ def column_costs(fqn: str, progress: Quiet | None = None) -> dict:
         except BaseException:
             con.execute("ROLLBACK")
             raise
-    return {"columns": out, "receipt": combine_receipts([r.get("receipt", {}) for _, r in runs])}
+    return {"columns": out, "warnings": warnings,
+            "receipt": combine_receipts([r.get("receipt", {}) for _, r in runs])}
 
 
 def _json_value(value):

@@ -1,6 +1,10 @@
 """Errors safe to expose through the CLI, HTTP, and MCP interfaces."""
 
 from google.api_core.exceptions import BadRequest, Forbidden, GoogleAPIError, NotFound
+from google.auth.exceptions import DefaultCredentialsError, RefreshError, TransportError
+from requests.exceptions import ConnectionError as RequestsConnectionError, Timeout as RequestsTimeout
+
+LOGIN = "Run `gcloud auth application-default login`"
 
 
 class SoundingError(ValueError):
@@ -22,6 +26,12 @@ class CatalogVersionError(SoundingError):
 def public_error(error: Exception) -> tuple[str, int]:
     if isinstance(error, SoundingError):
         return str(error), error.status
+    if isinstance(error, DefaultCredentialsError):
+        return f"No Google credentials found. {LOGIN}, or set GOOGLE_APPLICATION_CREDENTIALS.", 401
+    if isinstance(error, RefreshError):
+        return f"Your Google credentials have expired or were revoked. {LOGIN} again.", 401
+    if isinstance(error, (TransportError, RequestsConnectionError, RequestsTimeout)):
+        return "Could not reach Google. Check your network connection and retry.", 502
     if isinstance(error, Forbidden):
         return "BigQuery denied access. Check your Google credentials and permissions.", 403
     if isinstance(error, NotFound):

@@ -31,7 +31,7 @@ ASSET_API = "https://cloudasset.googleapis.com/v1"
 DEFAULT_TRANSFER_LOCATIONS = ("us", "eu")  # transfer configs live in the dataset's location
 DATAFORM_ALL_LOCATIONS = "-"              # Dataform accepts locations/- for every region
 PAGE_SIZE = 500
-MAX_ASSETS = 20_000
+MAX_ASSETS = 100_000  # a discovery stops here, keeps what it found, and says it was truncated
 MAX_DATAFORM_ACTIONS = 20_000
 TRANSFER_DROP = {"ownerInfo", "userId", "emailPreferences"}
 # Resource types that hold or move data. Cloud Asset rejects unknown types, so this list
@@ -46,10 +46,34 @@ DATA_ASSET_TYPES = (
     "composer.googleapis.com/Environment", "looker.googleapis.com/Instance",
 )
 API_NAMES = {TRANSFER_API: "BigQuery Data Transfer API", DATAFORM_API: "Dataform API", ASSET_API: "Cloud Asset API"}
-# DDL and DML that name the table a scheduled query writes, when it has no destination setting.
+# DDL and DML that name the table a scheduled query writes, when it has no destination
+# setting. Identifiers may be quoted whole (`p.d.t`) or per part (`p`.`d`.`t`).
+_PART = r"(?:`[^`]+`|[\w-]+)"
 WRITE_TARGET = re.compile(
-    r"\b(?:CREATE\s+(?:OR\s+REPLACE\s+)?(?:TEMP(?:ORARY)?\s+)?TABLE(?:\s+IF\s+NOT\s+EXISTS)?|INSERT\s+(?:INTO\s+)?|MERGE\s+(?:INTO\s+)?)\s*`?([\w-]+(?:\.[\w-]+){1,2})`?",
+    r"\b(CREATE\s+(?:OR\s+REPLACE\s+)?(?:(TEMP(?:ORARY)?)\s+)?TABLE(?:\s+IF\s+NOT\s+EXISTS)?"
+    r"|INSERT\s+(?:INTO\s+)?|MERGE\s+(?:INTO\s+)?)\s*(" + _PART + r"(?:\." + _PART + r"){0,2})",
     re.IGNORECASE)
+# Comments and string literals (triple-quoted first), blanked before matching so text
+# inside them is never taken for a target.
+_NOISE = re.compile(
+    r"--[^\n]*|#[^\n]*|/\*.*?\*/"
+    r"|'{3}.*?'{3}|\"{3}.*?\"{3}"
+    r"|'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"",
+    re.DOTALL)
+
+
+def written_table(sql: str) -> str | None:
+    """The last permanent table a script creates, inserts into or merges into.
+
+    Scripts often build staging tables first, so the last write is the likeliest output.
+    Temporary tables and unqualified names (script variables or temp tables) are skipped.
+    """
+    found = None
+    for m in WRITE_TARGET.finditer(_NOISE.sub(" ", sql)):
+        name = ".".join(part.strip("`") for part in re.findall(_PART, m.group(3)))
+        if not m.group(2) and "." in name:
+            found = name
+    return found
 
 
 def session() -> AuthorizedSession:
@@ -75,7 +99,9 @@ def _get(s, url: str, params: dict | None = None) -> dict:
     raise SoundingError(f"{api} returned HTTP {r.status_code}{reason}.")
 
 
-def _pages(s, url: str, key: str, params: dict | None = None, limit: int = MAX_ASSETS):
+def _pages(s, url: str, key: str, params: dict | None = None, limit: int = MAX_ASSETS, *, truncate=None):
+    """Follow nextPageToken. Past `limit` items, raise; or, given a `truncate` list, stop and
+    append a note to it so the caller keeps what it has."""
     params = dict(params or {})
     count = 0
     while True:
@@ -83,7 +109,10 @@ def _pages(s, url: str, key: str, params: dict | None = None, limit: int = MAX_A
         for item in body.get(key, []):
             count += 1
             if count > limit:
-                raise SoundingError(f"More than {limit} results; narrow the scope.")
+                if truncate is None:
+                    raise SoundingError(f"More than {limit} results; narrow the scope.")
+                truncate.append(f"Stopped at {limit} results; more exist. Narrow the scope or pass --type.")
+                return
             yield item
         token = body.get("nextPageToken")
         if not token:
@@ -115,8 +144,8 @@ def transfer_record(r: dict, project: str) -> dict:
         target, target_from = f"{project}.{dataset}.{template}", "destination setting"
     elif dataset and template:
         target, target_from = f"{project}.{dataset}.{template}", "destination template (one table per run)"
-    elif sql and (m := WRITE_TARGET.search(sql)):
-        target, target_from = _qualify(m.group(1), project, dataset), "parsed from the SQL"
+    elif sql and (written := written_table(sql)):
+        target, target_from = _qualify(written, project, dataset), "parsed from the SQL"
     return {"kind": "scheduled_query" if source == "scheduled_query" else f"transfer:{source}",
             "name": r["name"], "display_name": r.get("displayName"), "target": target,
             "target_from": target_from, "sql": sql, "dependencies": None, "schedule": r.get("schedule"),
@@ -137,7 +166,9 @@ def _columns(descriptor: dict | None) -> list[dict] | None:
 
 def dataform_record(action: dict, repository: str, location: str) -> dict | None:
     """One compiled Dataform action: a table, view, incremental table, operation or assertion."""
-    target = _target(action.get("canonicalTarget") or action.get("target"))
+    # target has the compilation's schema suffix, table prefix and database overrides applied,
+    # so it names the table BigQuery has and matches dependencyTargets; canonicalTarget doesn't.
+    target = _target(action.get("target") or action.get("canonicalTarget"))
     for kind in ("relation", "operations", "assertion"):
         if body := action.get(kind):
             break
@@ -160,9 +191,10 @@ def dataform_record(action: dict, repository: str, location: str) -> dict | None
 
 
 def _newest_compilation(s, repository: str) -> dict | None:
-    results = list(_pages(s, f"{DATAFORM_API}/{repository}/compilationResults", "compilationResults",
-                          {"pageSize": 50, "orderBy": "create_time desc"}, limit=50))
-    return max(results, key=lambda r: r.get("createTime", ""), default=None)
+    """One page, newest first. max() also covers a server that ignores orderBy."""
+    page = _get(s, f"{DATAFORM_API}/{repository}/compilationResults",
+                {"pageSize": 50, "orderBy": "create_time desc"})
+    return max(page.get("compilationResults", []), key=lambda r: r.get("createTime", ""), default=None)
 
 
 def builders(project: str, transfer_locations=DEFAULT_TRANSFER_LOCATIONS,
@@ -236,15 +268,17 @@ def discover(scope: str, asset_types=DATA_ASSET_TYPES) -> dict:
         pass
     # Only the fields below are requested; additionalAttributes and IAM policies are never read.
     fields = "name,assetType,project,displayName,description,location,labels,createTime,updateTime,state"
+    warnings = []
     rows = [asset_record(r) for r in _pages(
         session(), f"{ASSET_API}/{scope}:searchAllResources", "results",
-        {"assetTypes": list(asset_types), "pageSize": PAGE_SIZE, "readMask": fields})]
+        {"assetTypes": list(asset_types), "pageSize": PAGE_SIZE, "readMask": fields},
+        limit=MAX_ASSETS, truncate=warnings)]
     catalog.save_source_run("assets", scope, rows)
     by_type = {}
     for r in rows:
         by_type[r["asset_type"]] = by_type.get(r["asset_type"], 0) + 1
     return {"scope": scope, "assets": len(rows), "by_type": dict(sorted(by_type.items())),
-            "receipt": admin_receipt("cloudasset searchAllResources")}
+            "truncated": bool(warnings), "warnings": warnings, "receipt": admin_receipt("cloudasset searchAllResources")}
 
 
 def admin_receipt(*calls: str) -> dict:

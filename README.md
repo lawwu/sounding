@@ -175,9 +175,10 @@ sounding assets --type bucket
 
 ### Catalog upgrades
 
-This version uses catalog schema 4 (schema 3 plus the builders and discovery tables).
-A schema 2 or 3 catalog is upgraded in place, one step at a time, the first
-time any Sounding command opens it: the new fields are added, existing snapshots show
+This version uses catalog schema 3. The prototype builders and discovery tables are
+added the first time `harvest-builders` or `discover` writes, without changing the
+schema version, so released Sounding still opens the catalog. A schema 2 catalog is
+upgraded in place the first time any Sounding command opens it: the new fields are added, existing snapshots show
 them as unknown until the next harvest, and nothing needs re-harvesting. The upgrade
 runs in one transaction, so a failure leaves the catalog as it was.
 

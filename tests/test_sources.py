@@ -188,3 +188,69 @@ def test_disabled_asset_api_is_a_clear_error(monkeypatch):
     monkeypatch.setattr(sources, "session", lambda: FakeSession({url: disabled("Cloud Asset API")}))
     with pytest.raises(sources.ApiUnavailable, match="Cloud Asset API is not enabled"):
         sources.discover("projects/proj")
+
+
+def test_newest_compilation_reads_one_page_only():
+    repo = "projects/p/locations/l/repositories/r"
+    page = lambda start: {"compilationResults": [
+        {"name": f"{repo}/compilationResults/c{i}", "createTime": f"2026-10-{i % 28 + 1:02}T00:00:00Z"}
+        for i in range(start, start + 50)]}
+    fake = FakeSession({f"{sources.DATAFORM_API}/{repo}/compilationResults": [page(0), page(50)]})
+    assert sources._newest_compilation(fake, repo)["name"].endswith("/c27")
+    assert len(fake.calls) == 1
+
+
+def test_dataform_target_uses_compiled_name_with_overrides():
+    record = sources.dataform_record({"target": target("orders", "mart_prod"),
+                                      "canonicalTarget": target("orders", "mart"),
+                                      "relation": {"selectQuery": "SELECT 1"}}, "r", "l")
+    assert record["target"] == "proj.mart_prod.orders"
+
+
+def test_written_table_ignores_comments_strings_and_temp_tables():
+    w = sources.written_table
+    assert w("-- replaces INSERT INTO old.report\nCREATE OR REPLACE TABLE mart.report AS SELECT 1") == "mart.report"
+    assert w("CREATE TABLE staging.tmp AS SELECT 1; INSERT INTO mart.final SELECT * FROM staging.tmp") == "mart.final"
+    assert w("CREATE OR REPLACE TABLE `proj`.`ds`.`t` AS SELECT 1") == "proj.ds.t"
+    assert w("CREATE TEMP TABLE x AS SELECT 1; MERGE `p.d.t` USING x ON TRUE") == "p.d.t"
+    assert w("SELECT 'INSERT INTO a.b' AS s /* MERGE c.d */") is None
+    assert w("INSERT tbl VALUES (1)") is None
+
+
+def test_overlapping_scopes_keep_each_resource_once(monkeypatch):
+    monkeypatch.setattr(sources, "session", lambda: FakeSession(builder_routes()))
+    sources.builders(P)
+    regional = builder_routes()
+    regional[f"{sources.DATAFORM_API}/projects/proj/locations/us-central1/repositories"] = \
+        regional.pop(f"{sources.DATAFORM_API}/projects/proj/locations/-/repositories")
+    monkeypatch.setattr(sources, "session", lambda: FakeSession(regional))
+    sources.builders(P, dataform_location="us-central1")
+    url = lambda scope: f"{sources.ASSET_API}/{scope}:searchAllResources"
+    bucket = asset("raw-landing", "storage.googleapis.com/Bucket")
+    for scope in ("organizations/1", "projects/proj"):
+        monkeypatch.setattr(sources, "session", lambda: FakeSession({url(scope): [{"results": [bucket]}]}))
+        sources.discover(scope)
+    with catalog.connect() as con:
+        assert len(catalog.lineage(con, "proj.mart.orders")["built_by"]) == 1
+        assert len(catalog.search_assets(con)["items"]) == 1
+
+
+def test_discover_keeps_what_it_found_past_the_cap(monkeypatch):
+    monkeypatch.setattr(sources, "MAX_ASSETS", 2)
+    url = f"{sources.ASSET_API}/projects/proj:searchAllResources"
+    pages = [{"results": [asset(f"b{i}", "storage.googleapis.com/Bucket")]} for i in range(3)]
+    monkeypatch.setattr(sources, "session", lambda: FakeSession({url: pages}))
+    result = sources.discover("projects/proj")
+    assert result["assets"] == 2 and result["truncated"] and "Stopped at 2" in result["warnings"][0]
+    with catalog.connect() as con:
+        assert len(catalog.search_assets(con)["items"]) == 2
+
+
+def test_prototype_tables_leave_the_schema_version_alone(monkeypatch):
+    monkeypatch.setattr(sources, "session", lambda: FakeSession(builder_routes()))
+    with catalog.connect() as con:  # a fresh catalog has no source tables, and reads still work
+        assert catalog.lineage(con, "p.d.t") == {"built_by": [], "read_by": []}
+        assert catalog.search_builders(con)["items"] == [] == catalog.search_assets(con)["items"]
+    sources.builders(P)
+    with catalog.connect() as con:
+        assert con.execute("SELECT version FROM catalog_meta").fetchone()[0] == catalog.SCHEMA_VERSION == 3

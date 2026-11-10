@@ -21,7 +21,7 @@ from .errors import CatalogBusy, CatalogVersionError, MissingTable, integer, tex
 
 CATALOG = Path(os.environ.get("SOUNDING_CATALOG", Path.home() / ".sounding" / "catalog.duckdb"))
 LOCK_TIMEOUT = 10
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 3
 USD_PER_TIB = 6.25  # US on-demand list price; excludes discounts and the monthly free tier.
 TIB = 1024**4
 MIB = 1024**2
@@ -77,24 +77,25 @@ CREATE TABLE routines (
   PRIMARY KEY (snapshot_id, fqn));
 UPDATE catalog_meta SET version = 3;
 """,
-    # Sources beyond BigQuery's own metadata (prototype): what builds each table, and
-    # Cloud Asset Inventory's list of data-holding resources. Each run replaces the
-    # previous run for the same (source, scope).
-    3: """
-CREATE TABLE source_runs (
+}
+# Prototype sources beyond BigQuery's own metadata: what builds each table, and Cloud
+# Asset Inventory's data-holding resources. They are created on first write rather than by
+# a schema migration, so a catalog stays at schema 3 and released Sounding keeps opening it
+# (it ignores tables it doesn't know). Each run replaces the previous run for its
+# (source, scope); readers treat missing tables as "nothing harvested".
+SOURCE_TABLES = """
+CREATE TABLE IF NOT EXISTS source_runs (
   run_id BIGINT PRIMARY KEY, taken_at TIMESTAMPTZ NOT NULL, source VARCHAR NOT NULL, scope VARCHAR NOT NULL);
-CREATE TABLE builders (
+CREATE TABLE IF NOT EXISTS builders (
   run_id BIGINT, kind VARCHAR, name VARCHAR, display_name VARCHAR, target VARCHAR,
   target_from VARCHAR, sql VARCHAR, dependencies VARCHAR[], schedule VARCHAR, state VARCHAR,
   description VARCHAR, columns JSON, location VARCHAR, updated TIMESTAMPTZ, resource JSON,
   PRIMARY KEY (run_id, name));
-CREATE TABLE assets (
+CREATE TABLE IF NOT EXISTS assets (
   run_id BIGINT, name VARCHAR, asset_type VARCHAR, project VARCHAR, display_name VARCHAR,
   description VARCHAR, location VARCHAR, labels JSON, created TIMESTAMPTZ, updated TIMESTAMPTZ,
   state VARCHAR, PRIMARY KEY (run_id, name));
-UPDATE catalog_meta SET version = 4;
-""",
-}
+"""
 JSON_FIELDS = {"columns", "labels", "foreign_keys", "storage", "external", "materialized_view", "resource", "arguments"}
 
 LATEST = """WITH latest AS (
@@ -276,6 +277,7 @@ def save_source_run(source: str, scope: str, rows: list[dict]) -> int:
     with connect(write=True) as con:
         con.execute("BEGIN")
         try:
+            con.execute(SOURCE_TABLES)
             rid = con.execute("SELECT coalesce(max(run_id), 0) + 1 FROM source_runs").fetchone()[0]
             con.execute("INSERT INTO source_runs VALUES (?, ?, ?, ?)", [rid, dt.datetime.now(dt.UTC), source, scope])
             if rows:
@@ -291,6 +293,18 @@ def save_source_run(source: str, scope: str, rows: list[dict]) -> int:
 
 
 LATEST_RUNS = "(SELECT max(run_id) AS run_id FROM source_runs GROUP BY source, scope)"
+
+
+def _current(table: str) -> str:
+    """Rows of the latest run per (source, scope). Scopes can overlap (an organization and
+    one of its projects, all Dataform regions and one region), so each resource is kept once,
+    from its newest run."""
+    return (f"(SELECT * FROM {table} JOIN {LATEST_RUNS} USING (run_id) "
+            f"QUALIFY row_number() OVER (PARTITION BY name ORDER BY run_id DESC) = 1)")
+
+
+def _has_sources(con) -> bool:
+    return con.execute("SELECT count(*) FROM duckdb_tables() WHERE table_name = 'source_runs'").fetchone()[0] > 0
 BUILDER_COLUMNS = "kind, name, display_name, target, target_from, dependencies, schedule, state, location, updated"
 
 
@@ -305,8 +319,10 @@ def _builder(r, sql_chars: int | None = 1000) -> dict:
 
 def lineage(con, fqn: str) -> dict:
     """Builders that write this table, and builders that read it. Empty when none were harvested."""
+    if not _has_sources(con):
+        return {"built_by": [], "read_by": []}
     rows = con.execute(f"""
-        SELECT {BUILDER_COLUMNS}, sql, target = $fqn AS writes FROM builders JOIN {LATEST_RUNS} USING (run_id)
+        SELECT {BUILDER_COLUMNS}, sql, target = $fqn AS writes FROM {_current("builders")}
         WHERE target = $fqn OR list_contains(dependencies, $fqn) ORDER BY kind, name""", {"fqn": fqn}).fetchall()
     return {"built_by": [_builder(r) for r in rows if r[11]],
             "read_by": [_builder(r, sql_chars=0) for r in rows if not r[11]]}
@@ -317,8 +333,10 @@ def search_builders(con, q: str = "", limit: int = 50, offset: int = 0) -> dict:
     q = text(q, "q", empty=True).strip()
     integer(limit, "limit", 1, SEARCH_LIMIT)
     integer(offset, "offset", 0, 1_000_000)
+    if not _has_sources(con):
+        return {"items": [], "next_offset": None}
     rows = con.execute(f"""
-        SELECT {BUILDER_COLUMNS}, sql FROM builders JOIN {LATEST_RUNS} USING (run_id)
+        SELECT {BUILDER_COLUMNS}, sql FROM {_current("builders")}
         WHERE $q = '' OR contains(lower(name), lower($q)) OR contains(lower(coalesce(display_name, '')), lower($q))
               OR contains(lower(coalesce(target, '')), lower($q)) OR contains(lower(coalesce(sql, '')), lower($q))
               OR contains(lower(array_to_string(dependencies, ' ')), lower($q))
@@ -334,9 +352,11 @@ def search_assets(con, q: str = "", asset_type: str = "", limit: int = 50, offse
     asset_type = text(asset_type, "asset_type", empty=True).strip()
     integer(limit, "limit", 1, SEARCH_LIMIT)
     integer(offset, "offset", 0, 1_000_000)
+    if not _has_sources(con):
+        return {"items": [], "next_offset": None}
     rows = con.execute(f"""
         SELECT asset_type, name, display_name, description, location, labels, updated, state
-        FROM assets JOIN {LATEST_RUNS} USING (run_id)
+        FROM {_current("assets")}
         WHERE ($type = '' OR contains(lower(asset_type), lower($type)))
           AND ($q = '' OR contains(lower(name), lower($q)) OR contains(lower(coalesce(display_name, '')), lower($q))
                OR contains(lower(coalesce(description, '')), lower($q)))
