@@ -1,7 +1,7 @@
-"""The only module that calls BigQuery: metadata (datasets, tables, routines), dry runs, tabledata.list and jobs.list only.
+"""The only module that calls BigQuery.
 
-No billed queries or Storage Read API calls are made, and the harvester never reads
-INFORMATION_SCHEMA. User SQL, INFORMATION_SCHEMA included, is only ever dry-run.
+Metadata, previews and user-SQL dry runs are free. The separate opt-in workload
+scan executes fixed INFORMATION_SCHEMA SQL with a byte cap; never business SQL.
 """
 
 from __future__ import annotations
@@ -18,9 +18,9 @@ from concurrent.futures import ThreadPoolExecutor
 from google.api_core.exceptions import Forbidden, NotFound
 from google.cloud import bigquery
 
-from . import catalog
+from . import catalog, workload
 from .progress import Quiet
-from .errors import SoundingError, integer, text
+from .errors import SoundingError, integer, text, public_error
 
 JOB_PROJECT = os.environ.get("SOUNDING_JOB_PROJECT")
 GET_TABLE_WORKERS = 16  # concurrent tables.get / routines.get calls within one dataset
@@ -409,7 +409,7 @@ def column_costs(fqn: str, progress: Quiet | None = None) -> dict:
 
 
 def _json_value(value):
-    if isinstance(value, dict):
+    if hasattr(value, "items"):
         return {k: _json_value(v) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
         return [_json_value(v) for v in value]
@@ -441,7 +441,7 @@ def cost_report(hours: int = 24) -> dict:
     """Every job your identity ran in the job project over the window, with BigQuery's billed bytes.
 
     jobs.list is free. Dry runs, metadata calls and tabledata.list never create jobs, so
-    a Sounding-only window lists none; any billable query, from any tool, appears here
+    a window using only those free operations lists none; opt-in workload scans appear here
     with its own statistics.query.totalBytesBilled. Billing reports remain the final word.
     """
     integer(hours, "hours", 1, COST_REPORT_MAX_HOURS)
@@ -479,3 +479,168 @@ def cost_report(hours: int = 24) -> dict:
             "source": "BigQuery jobs.list (free) for jobs your identity ran in this project. Dry runs, "
                       "metadata calls and previews never create jobs, so they never appear. Jobs billed "
                       "to other projects are not shown; your billing report is the final word."}
+
+
+def query_opportunities(location: str, *, project: str | None = None, hours: int = 168,
+                        scope: str = "user", rank_by: str = "billed_bytes", limit: int = 20,
+                        max_bytes_billed: int = workload.DEFAULT_MAX_BYTES,
+                        min_billed_bytes: int = workload.DEFAULT_MIN_BILLED_BYTES,
+                        min_slot_ms: int = workload.DEFAULT_MIN_SLOT_MS,
+                        allow_billed: bool = False) -> dict:
+    """Preview by default; explicitly opt in to one capped metadata query and save it.
+
+    Fixed SQL only. No job retries, business-query execution, or automatic widening
+    of the time window, region, permissions or byte budget.
+    """
+    workload.validate(location, project, hours, scope, rank_by, limit, max_bytes_billed,
+                      min_billed_bytes, min_slot_ms, allow_billed)
+    # Check the catalog before spending, and release its lock before network I/O.
+    if allow_billed:
+        with catalog.connect():
+            pass
+    c = client()
+    project = workload.identifier(project if project is not None else c.project, "project")
+    until = dt.datetime.now(dt.UTC)
+    since = until - dt.timedelta(hours=hours)
+    sql = workload.query_sql(project, location, scope, rank_by)
+    parameters = [bigquery.ScalarQueryParameter(name, kind, value) for name, kind, value in (
+        ("since", "TIMESTAMP", since), ("until", "TIMESTAMP", until),
+        ("min_billed_bytes", "INT64", min_billed_bytes), ("min_slot_ms", "INT64", min_slot_ms),
+        ("limit", "INT64", limit))]
+    config = bigquery.QueryJobConfig(
+        dry_run=True, use_legacy_sql=False, use_query_cache=False,
+        maximum_bytes_billed=max_bytes_billed, query_parameters=parameters,
+        labels={"sounding_action": "query_opportunities"})
+    preview = c.query(sql, job_config=config, location=location, job_retry=None)
+    receipt = dry_run_receipt(preview)
+    reported = preview.total_bytes_processed
+    accuracy = _accuracy(preview._properties.get("statistics", {}).get("query", {}))
+    estimated = reported if reported and reported > 0 and accuracy in ("PRECISE", "UPPER_BOUND") else None
+    warnings = [
+        "INFORMATION_SCHEMA scans are uncached and may be billed (10 MB minimum on demand).",
+        "The byte cap limits on-demand scan charges; it is not a capacity/slot spending cap.",
+        "Candidates are successful, non-cached query jobs created in this window and location; script parents and Sounding scans are excluded.",
+        "Rankings use known totals, which can be incomplete. High usage and repeated queries are leads, not proof of waste or guaranteed savings.",
+        "Normalized hashes group query templates, not identical results; they may change with underlying schemas or views.",
+        "Dollar figures are US on-demand scan equivalents, not invoices; external services and model-training charges are not estimated.",
+    ]
+    if estimated is None:
+        warnings.append("The dry-run estimate is unknown; zero or missing bytes do not mean execution is free. The execution byte cap still applies.")
+    if not receipt["free"]:
+        warnings.append("The preview response did not confirm a free dry run; execution is blocked.")
+    over_budget = reported is not None and reported > max_bytes_billed
+    if over_budget:
+        warnings.append("The dry-run bytes exceed the cap. Shorten the window or explicitly increase the cap.")
+    result = {"status": "preview", "project": project, "job_project": c.project,
+              "location": location, "scope": scope, "since": since.isoformat(),
+              "until": until.isoformat(), "hours": hours, "rank_by": rank_by, "limit": limit,
+              "thresholds": {"min_billed_bytes": min_billed_bytes, "min_slot_ms": min_slot_ms},
+              "max_bytes_billed": max_bytes_billed,
+              "max_scan_usd_on_demand": catalog.usd(max_bytes_billed),
+              "reported_bytes": reported, "estimated_bytes": estimated,
+              "estimate_status": ("upper_bound" if accuracy == "UPPER_BOUND" else "estimated") if estimated else "unknown",
+              "within_byte_cap": not over_budget if estimated is not None else None,
+              "price_basis": PRICE_BASIS, "sql": sql, "warnings": warnings, "receipt": receipt}
+    if not allow_billed:
+        return result
+    if not receipt["free"] or over_budget:
+        result["status"] = "blocked"
+        return result
+    # Create a fresh config; do not mutate the one sent to the dry run.
+    execution_config = bigquery.QueryJobConfig.from_api_repr(config.to_api_repr())
+    execution_config.dry_run = False
+    execution_config.job_timeout_ms = 60_000  # best effort, not a hard slot budget
+    job = c.query(sql, job_config=execution_config, location=location, job_retry=None)
+    execution_error = None
+    try:
+        rows = [_json_value(row) for row in job.result()]
+    except Exception as error:
+        # Keep the job identity and any available billing evidence after submission.
+        # The operator can inspect it without paying for another scan.
+        rows = []
+        execution_error = public_error(error)[0]
+    stats = job._properties.get("statistics", {}).get("query", {})
+    billed = _int(stats.get("totalBytesBilled"))
+    result.update(status="failed" if execution_error else "complete", preview_receipt=receipt,
+                  opportunities=[workload.opportunity(row) for row in rows],
+                  total_candidates=None if execution_error else (rows[0]["total_candidates"] if rows else 0),
+                  truncated=bool(rows and rows[0]["total_candidates"] > len(rows)),
+                  receipt={"call": "jobs.insert (INFORMATION_SCHEMA query)", "free": False,
+                           "job_id": job.job_id, "job_project": job.project, "location": job.location,
+                           "billed_bytes": billed, "processed_bytes": _int(stats.get("totalBytesProcessed")),
+                           "slot_ms": _int(stats.get("totalSlotMs")),
+                           "usd_on_demand_equivalent": catalog.usd(billed),
+                           "maximum_bytes_billed": max_bytes_billed,
+                           "state": job.state,
+                           "source": "BigQuery job statistics; a metadata query was submitted."})
+    if execution_error:
+        result["error"] = execution_error
+        warnings.append("The metadata query did not return a complete result. Inspect the receipt's job ID for status and billing; no replacement job was submitted.")
+    elif not rows:
+        warnings.append("No candidates in this scope. Check location, identity, window and thresholds; this does not establish zero project usage.")
+    try:
+        return catalog.save_workload_report(result)
+    except Exception:
+        # A local write failure must not discard a paid result and encourage another scan.
+        logging.exception("Could not save completed workload report")
+        result.update(report_id=None, saved_at=None)
+        warnings.append("The scan completed but could not be saved locally. Keep this result; rerunning would execute another billed scan.")
+        return result
+
+
+def inspect_query_job(job_id: str, location: str, *, project: str | None = None,
+                      include_sql: bool = False) -> dict:
+    """Free jobs.get point lookup; report evidence without executing the query."""
+    text(job_id, "job_id", 1024)
+    workload.identifier(location, "location")
+    if project is not None:
+        workload.identifier(project, "project")
+    if type(include_sql) is not bool:
+        raise SoundingError("include_sql must be true or false.")
+    c = client()
+    job = c.get_job(job_id, project=project or c.project, location=location)
+    if job.job_type != "query":
+        raise SoundingError("The requested job is not a query job.")
+    props = job._properties
+    stats = props.get("statistics", {})
+    query = stats.get("query", {})
+    insights = query.get("performanceInsights") or {}
+    findings = []
+    for insight in insights.get("stagePerformanceStandaloneInsights", []):
+        for api_key, signal in (("slotContention", "slot_contention"),
+                                ("insufficientShuffleQuota", "insufficient_shuffle"),
+                                ("highCardinalityJoins", "high_cardinality_join"),
+                                ("partitionSkew", "partition_skew")):
+            if insight.get(api_key):
+                findings.append({"signal": signal, "stage_id": insight.get("stageId"),
+                                 "evidence": insight[api_key], "next_step": workload.SIGNALS[signal]})
+    stages = query.get("queryPlan", [])
+    for stage in stages:
+        spilled = _int(stage.get("shuffleOutputBytesSpilled"))
+        read, written = _int(stage.get("recordsRead")), _int(stage.get("recordsWritten"))
+        if spilled and spilled > 0:
+            findings.append({"signal": "shuffle_spill", "stage_id": stage.get("id"),
+                             "bytes": spilled, "next_step": workload.SIGNALS["insufficient_shuffle"]})
+        if read and written is not None and written > 10 * read:
+            findings.append({"signal": "row_expansion", "stage_id": stage.get("id"),
+                             "ratio": written / read,
+                             "next_step": "Check joins and UNNEST operations for unintended row multiplication; expansion can also be intentional."})
+    sql = props.get("configuration", {}).get("query", {}).get("query")
+    return {"project": job.project, "location": job.location, "job_id": job.job_id,
+            "state": job.state, "statement_type": query.get("statementType"),
+            "error_reason": (props.get("status", {}).get("errorResult") or {}).get("reason"),
+            "created": _iso(job.created), "started": _iso(job.started), "ended": _iso(job.ended),
+            "billed_bytes": _int(query.get("totalBytesBilled")),
+            "processed_bytes": _int(query.get("totalBytesProcessed")),
+            "slot_ms": _int(query.get("totalSlotMs")), "cache_hit": query.get("cacheHit"),
+            "labels": props.get("configuration", {}).get("labels", {}),
+            "referenced_tables": [_ref(r) for r in query.get("referencedTables", [])],
+            "performance_insights": insights, "findings": findings,
+            "stages": [{k: stage[k] for k in ("id", "name", "recordsRead", "recordsWritten", "slotMs",
+                "shuffleOutputBytes", "shuffleOutputBytesSpilled", "waitRatioAvg", "computeRatioAvg") if k in stage}
+                for stage in stages[:100]], "stages_truncated": len(stages) > 100,
+            "sql": sql[:MAX_SQL_LENGTH] if include_sql and sql is not None else None,
+            "sql_truncated": bool(include_sql and sql and len(sql) > MAX_SQL_LENGTH),
+            "warnings": ["Missing stages or insights do not establish that a query is efficient; row-level security can hide execution statistics.",
+                         "Inspect SQL and table metadata before applying a recommendation. Labels may identify a dbt model or owner."],
+            "receipt": free_api_receipt("jobs.get")}

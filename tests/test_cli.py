@@ -1,4 +1,5 @@
 import sys
+import json
 
 import pytest
 from google.auth.exceptions import DefaultCredentialsError, RefreshError
@@ -47,3 +48,35 @@ def test_show_prints_unknown_sizes_as_unknown(seed, monkeypatch, capsys):
     view = next(line for line in out.out.splitlines() if line.endswith("p.d.v"))
     assert code == 0 and view.split()[:2] == ["unknown", "unknown"]
     assert "0.00" not in view
+
+
+@pytest.mark.parametrize("execute", [False, True])
+def test_query_opportunities_cli_explicit_billing_and_options(monkeypatch, capsys, execute):
+    seen = {}
+    def scan(**kwargs):
+        seen.update(kwargs)
+        return {"status": "complete" if kwargs["allow_billed"] else "preview"}
+    monkeypatch.setattr(bq, "query_opportunities", scan)
+    args = ["query-opportunities", "--location", "EU", "--project", "p",
+            "--scope", "project", "--rank-by", "slot_ms", "--hours", "24"]
+    if execute:
+        args.append("--allow-billed")
+    code, out = run(monkeypatch, capsys, *args)
+    assert code == 0 and json.loads(out.out)["status"] == ("complete" if execute else "preview")
+    assert seen["allow_billed"] is execute and seen["location"] == "EU"
+    assert seen["project"] == "p" and seen["scope"] == "project"
+    assert seen["rank_by"] == "slot_ms" and seen["hours"] == 24
+
+
+@pytest.mark.parametrize("status", ["blocked", "failed"])
+def test_unsuccessful_scan_preserves_json_and_exits_nonzero(monkeypatch, capsys, status):
+    monkeypatch.setattr(bq, "query_opportunities", lambda **k: {"status": status, "receipt": {"job_id": "j"}})
+    code, out = run(monkeypatch, capsys, "query-opportunities", "--location", "US", "--allow-billed")
+    assert code == 2 and json.loads(out.out)["receipt"]["job_id"] == "j"
+
+
+def test_query_report_cli_is_local(monkeypatch, capsys):
+    from sounding import catalog
+    saved = catalog.save_workload_report({"status": "complete", "project": "p"})
+    code, out = run(monkeypatch, capsys, "query-report", saved["report_id"])
+    assert code == 0 and json.loads(out.out) == saved
