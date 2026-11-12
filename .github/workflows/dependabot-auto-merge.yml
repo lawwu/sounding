@@ -1,0 +1,29 @@
+# Turns on auto-merge (squash) for Dependabot's patch and minor updates to the GitHub
+# Actions and to uv.lock. Majors, and any update whose kind fetch-metadata can't tell,
+# wait for a person. A group's kind is its largest update. uv.lock pins only what CI and
+# development install; people installing Sounding resolve their own versions from
+# pyproject.toml's ranges, which Dependabot doesn't widen.
+# Auto-merge waits for the checks the ruleset on main requires (Tests, Actions lock and
+# zizmor), so nothing merges until they pass. Needs Settings → General → Allow auto-merge.
+name: dependabot-auto-merge
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  auto-merge:
+    if: github.event.pull_request.user.login == 'dependabot[bot]' && github.repository == 'lawwu/sounding'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - id: meta
+        uses: dependabot/fetch-metadata@v3.1.0
+      - name: Auto-merge once CI passes (patch and minor only)
+        if: >-
+          steps.meta.outputs.update-type == 'version-update:semver-patch' ||
+          steps.meta.outputs.update-type == 'version-update:semver-minor'
+        run: gh pr merge --auto --squash "$PR_URL"
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

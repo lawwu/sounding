@@ -387,6 +387,14 @@ skipped with an explicit reason if Node is missing). CI installs Node and runs t
 full suite. Tests also cover process/thread locks, rollback, Arrow field mapping,
 legacy catalogs, UTC round trips, price minimums, HTTP security, and MCP over stdio.
 
+The GitHub Actions workflows are locked: `.github/workflows/actions.lock` records the
+exact commit of every action, and CI fails if a workflow uses one it doesn't record or
+a tag has moved. After changing a workflow, relock with `gh actions-lock` (a GitHub CLI
+extension: `gh extension install github/gh-actions-lock`) and lint with
+`uvx zizmor .github/`. Keep comments off `uses:` lines; relocking drops them.
+Dependabot proposes Actions and `uv.lock` updates weekly, each at least 7 days old;
+patch and minor updates merge themselves once the required checks pass.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).

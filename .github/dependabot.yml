@@ -1,0 +1,26 @@
+# Dependabot opens one grouped pull request a week per ecosystem: the GitHub Actions the
+# workflows use, and uv.lock. Patch and minor updates merge themselves once the required
+# checks pass (.github/workflows/dependabot-auto-merge.yml); majors wait for a person. A
+# version is only proposed once it's 7 days old: a hijacked release is usually pulled
+# before then. Security fixes don't wait. Action updates also update
+# .github/workflows/actions.lock, which records the commit each version is.
+version: 2
+updates:
+  - package-ecosystem: uv
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      uv:
+        patterns: ['*']
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    cooldown:
+      default-days: 7
+    groups:
+      github-actions:
+        patterns: ['*']
