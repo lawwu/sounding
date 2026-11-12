@@ -10,6 +10,7 @@ import datetime as dt
 import json
 import os
 import sys
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -21,7 +22,7 @@ from .errors import CatalogBusy, CatalogVersionError, MissingTable, integer, tex
 
 CATALOG = Path(os.environ.get("SOUNDING_CATALOG", Path.home() / ".sounding" / "catalog.duckdb"))
 LOCK_TIMEOUT = 10
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 USD_PER_TIB = 6.25  # US on-demand list price; excludes discounts and the monthly free tier.
 TIB = 1024**4
 MIB = 1024**2
@@ -76,6 +77,11 @@ CREATE TABLE routines (
   definition VARCHAR, created TIMESTAMPTZ, modified TIMESTAMPTZ, resource JSON,
   PRIMARY KEY (snapshot_id, fqn));
 UPDATE catalog_meta SET version = 3;
+""",
+    3: """
+CREATE TABLE workload_reports (
+  report_id VARCHAR PRIMARY KEY, saved_at TIMESTAMPTZ NOT NULL, report JSON NOT NULL);
+UPDATE catalog_meta SET version = 4;
 """,
 }
 JSON_FIELDS = {"labels", "foreign_keys", "storage", "external", "materialized_view", "resource", "arguments"}
@@ -243,6 +249,27 @@ def save_snapshot(dataset: str, table_rows: list[dict], col_rows: list[dict],
 def _encode(row: dict) -> dict:
     return {k: json.dumps(v, sort_keys=True) if k in JSON_FIELDS and v is not None else v
             for k, v in row.items()}
+
+
+def save_workload_report(report: dict) -> dict:
+    """Store a completed bounded scan, including its billing receipt, in one insert."""
+    saved = report | {"report_id": uuid.uuid4().hex, "saved_at": dt.datetime.now(dt.UTC).isoformat()}
+    with connect(write=True) as con:
+        con.execute("INSERT INTO workload_reports VALUES (?, ?, ?)",
+                    [saved["report_id"], saved["saved_at"], json.dumps(saved)])
+    return saved
+
+
+def workload_report(con, report_id: str | None = None) -> dict:
+    """An exact report or the latest across all scopes; no BigQuery call or refresh."""
+    if report_id is not None:
+        text(report_id, "report_id", 128)
+        row = con.execute("SELECT report FROM workload_reports WHERE report_id = ?", [report_id]).fetchone()
+    else:
+        row = con.execute("SELECT report FROM workload_reports ORDER BY saved_at DESC, report_id DESC LIMIT 1").fetchone()
+    if row is None:
+        raise MissingTable("No saved query opportunity report found. Run query-opportunities with --allow-billed first.")
+    return json.loads(row[0])
 
 
 def _decode(key: str, value):
