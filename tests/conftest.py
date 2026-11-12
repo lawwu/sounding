@@ -2,13 +2,14 @@ import datetime as dt
 
 import pytest
 
-from sounding import bq, catalog
+from sounding import bq, catalog, sources
 
 
 @pytest.fixture(autouse=True)
 def isolated_catalog(tmp_path, monkeypatch):
     monkeypatch.setattr(catalog, "CATALOG", tmp_path / "catalog.duckdb")
     monkeypatch.setattr(bq, "client", lambda: pytest.fail("Unmocked BigQuery access in an offline test"))
+    monkeypatch.setattr(sources, "session", lambda: pytest.fail("Unmocked Google API access in an offline test"))
 
 
 def table_row(fqn="p.d.t", **overrides):

@@ -225,6 +225,41 @@ uv run sounding routines bignumber                             # search function
 uv run sounding routine bigquery-public-data.persistent_udfs.bignumber_add
 ```
 
+### Beyond BigQuery: builders and discovery (prototype)
+
+Two more free sources, read over Google's admin APIs. Neither is a BigQuery job or
+reads table data.
+
+```bash
+sounding harvest-builders my-project      # scheduled queries, transfers, Dataform
+sounding builders orders                  # search them by name, target, dependency or SQL
+sounding discover projects/my-project     # Cloud Asset Inventory (also folders/N, organizations/N)
+sounding assets --type bucket
+```
+
+- **Builders** answer "how is this table made?". From the BigQuery Data Transfer API,
+  each scheduled query's SQL and destination, and each other transfer's data source
+  (Google Ads, S3 and so on). When a scheduled query has no destination setting, the
+  table its `CREATE TABLE`, `INSERT` or `MERGE` writes is taken from the SQL, and
+  `target_from` says so. From Dataform, the newest compilation result of each
+  repository: every table, view, incremental table, operation and assertion, with its
+  SQL, dependencies, description and column descriptions. `sounding describe` and the
+  MCP `describe_table` then include `built_by` (with the SQL) and `read_by`.
+- **Discovery** lists the resources that hold or move data across a project, folder
+  or organization: buckets, Spanner, Cloud SQL, AlloyDB, Bigtable, Firestore, Pub/Sub
+  topics, Vertex AI datasets and models, Dataform, Composer and Looker. Only names,
+  types, locations, labels, descriptions and timestamps are requested; IAM policies and
+  `additionalAttributes` are never read. `--type` overrides the type list.
+- Owner emails on transfer configs (`ownerInfo`, `userId`) are dropped before
+  anything is stored, the same rule as dataset access lists.
+- Each source and location is saved as its own run and replaces only its previous run,
+  so a disabled API (each needs enabling: `bigquerydatatransfer.googleapis.com`,
+  `dataform.googleapis.com`, `cloudasset.googleapis.com`) skips that source and the
+  rest still land.
+- Not yet: the UI, scheduled queries' *input* tables (a free dry run of their SQL would
+  give them), and Dataform release configurations (production may run an older
+  compilation than the newest one).
+
 ### Catalog upgrades
 
 This version uses catalog schema 4. Schema 2 and 3 catalogs are upgraded in place
@@ -232,6 +267,10 @@ the first time any Sounding command opens them. Schema 3 adds richer metadata;
 schema 4 adds saved workload reports. Existing snapshots are preserved, and older
 metadata fields stay unknown until the next harvest. Each migration runs in one
 transaction, so a failed step rolls back without changing its starting schema.
+
+The prototype builders and discovery tables are added the first time
+`harvest-builders` or `discover` writes, without changing the schema version, so
+released Sounding still opens the catalog.
 
 Schema 1 catalogs (Sounding before 0.1.0) can't be converted reliably (timezone-less
 timestamps, alias-keyed snapshots). The first time Sounding opens one, it renames it
@@ -313,6 +352,7 @@ and the Python MCP SDK is the reference implementation.
 6. Opt-in billed profiling behind a byte cap and approval, with results cached in the catalog
 7. ✅ Keep the whole table resource (keys, partition guidance, storage, labels, policy tags), dataset settings and routines; next: BigQuery ML models and row-access policy metadata
 8. ✅ Opt-in query opportunity scans, saved reports and free job inspection; next: workload trends and a UI for reports
+9. Prototype: builders (scheduled queries, transfers, Dataform) and Cloud Asset discovery; next: Looker LookML
 
 ## Stability
 

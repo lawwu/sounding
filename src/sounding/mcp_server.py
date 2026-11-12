@@ -41,11 +41,34 @@ def create_server() -> MCPServer:
         with catalog.connect() as con:
             return catalog.search(con, q, limit, offset)
 
+    @app.tool(description="Literal substring search of harvested builders: scheduled queries, "
+              "transfers and Dataform actions, by name, target table, dependency or SQL. Use it to "
+              "find how a table is made or what reads it. Local only. SQL is a 300-character excerpt; "
+              "describe_table returns the full SQL in built_by.")
+    @tool_errors
+    def search_builders(q: Annotated[str, Field(max_length=2048)] = "",
+                        limit: Annotated[int, Field(ge=1, le=100)] = 50,
+                        offset: Annotated[int, Field(ge=0, le=1_000_000)] = 0) -> dict:
+        with catalog.connect() as con:
+            return catalog.search_builders(con, q, limit, offset)
+
+    @app.tool(description="Search resources found by Cloud Asset Inventory discovery (buckets, "
+              "Spanner and Cloud SQL databases, Pub/Sub topics, Vertex AI datasets and models, and "
+              "more) by name or description; asset_type filters by substring, e.g. 'Bucket'. Local only.")
+    @tool_errors
+    def search_assets(q: Annotated[str, Field(max_length=2048)] = "",
+                      asset_type: Annotated[str, Field(max_length=200)] = "",
+                      limit: Annotated[int, Field(ge=1, le=100)] = 50,
+                      offset: Annotated[int, Field(ge=0, le=1_000_000)] = 0) -> dict:
+        with catalog.connect() as con:
+            return catalog.search_assets(con, q, asset_type, limit, offset)
+
     @app.tool(description="Schema, size, UTC freshness, partitioning and clustering for "
               "project.dataset.table in the latest snapshot, plus declared (unenforced) keys, "
               "partition-filter requirements, storage bytes, labels, column policy tags, expiry, "
-              "snapshot/clone source and external or materialized-view settings. Read `notes` "
-              "before writing a query. Local only; never calls BigQuery. Missing values are null "
+              "snapshot/clone source and external or materialized-view settings, and, when builders "
+              "were harvested, `built_by` (the scheduled query or Dataform action that writes it, "
+              "with its SQL) and `read_by`. Read `notes` before writing a query. Local only; never calls BigQuery. Missing values are null "
               "(unknown), never zero.")
     @tool_errors
     def describe_table(table: Annotated[str, Field(min_length=1, max_length=2048)]) -> dict:

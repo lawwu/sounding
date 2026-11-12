@@ -84,7 +84,25 @@ CREATE TABLE workload_reports (
 UPDATE catalog_meta SET version = 4;
 """,
 }
-JSON_FIELDS = {"labels", "foreign_keys", "storage", "external", "materialized_view", "resource", "arguments"}
+# Prototype sources beyond BigQuery's own metadata: what builds each table, and Cloud
+# Asset Inventory's data-holding resources. They are created on first write rather than by
+# a schema migration, so a catalog stays at schema 3 and released Sounding keeps opening it
+# (it ignores tables it doesn't know). Each run replaces the previous run for its
+# (source, scope); readers treat missing tables as "nothing harvested".
+SOURCE_TABLES = """
+CREATE TABLE IF NOT EXISTS source_runs (
+  run_id BIGINT PRIMARY KEY, taken_at TIMESTAMPTZ NOT NULL, source VARCHAR NOT NULL, scope VARCHAR NOT NULL);
+CREATE TABLE IF NOT EXISTS builders (
+  run_id BIGINT, kind VARCHAR, name VARCHAR, display_name VARCHAR, target VARCHAR,
+  target_from VARCHAR, sql VARCHAR, dependencies VARCHAR[], schedule VARCHAR, state VARCHAR,
+  description VARCHAR, columns JSON, location VARCHAR, updated TIMESTAMPTZ, resource JSON,
+  PRIMARY KEY (run_id, name));
+CREATE TABLE IF NOT EXISTS assets (
+  run_id BIGINT, name VARCHAR, asset_type VARCHAR, project VARCHAR, display_name VARCHAR,
+  description VARCHAR, location VARCHAR, labels JSON, created TIMESTAMPTZ, updated TIMESTAMPTZ,
+  state VARCHAR, PRIMARY KEY (run_id, name));
+"""
+JSON_FIELDS = {"columns", "labels", "foreign_keys", "storage", "external", "materialized_view", "resource", "arguments"}
 
 LATEST = """WITH latest AS (
     SELECT dataset, max(snapshot_id) AS snapshot_id FROM snapshots GROUP BY dataset
@@ -118,6 +136,18 @@ DATASET_SCHEMA = pa.schema([
     ("created", _TS), ("modified", _TS), ("default_table_expiration_ms", pa.int64()),
     ("default_partition_expiration_ms", pa.int64()), ("storage_billing_model", pa.string()),
     ("max_time_travel_hours", pa.int64()), ("routines_status", pa.string()), ("resource", pa.string()),
+])
+BUILDER_SCHEMA = pa.schema([
+    ("run_id", pa.int64()), ("kind", pa.string()), ("name", pa.string()), ("display_name", pa.string()),
+    ("target", pa.string()), ("target_from", pa.string()), ("sql", pa.string()),
+    ("dependencies", _LIST), ("schedule", pa.string()), ("state", pa.string()),
+    ("description", pa.string()), ("columns", pa.string()), ("location", pa.string()),
+    ("updated", _TS), ("resource", pa.string()),
+])
+ASSET_SCHEMA = pa.schema([
+    ("run_id", pa.int64()), ("name", pa.string()), ("asset_type", pa.string()), ("project", pa.string()),
+    ("display_name", pa.string()), ("description", pa.string()), ("location", pa.string()),
+    ("labels", pa.string()), ("created", _TS), ("updated", _TS), ("state", pa.string()),
 ])
 ROUTINE_SCHEMA = pa.schema([
     ("snapshot_id", pa.int64()), ("dataset", pa.string()), ("routine_id", pa.string()),
@@ -244,6 +274,104 @@ def save_snapshot(dataset: str, table_rows: list[dict], col_rows: list[dict],
             con.execute("ROLLBACK")
             raise
     return sid
+
+
+def save_source_run(source: str, scope: str, rows: list[dict]) -> int:
+    """Publish one source run atomically; it replaces the previous run for (source, scope)."""
+    table, schema = {"builders": ("builders", BUILDER_SCHEMA), "assets": ("assets", ASSET_SCHEMA)}[
+        "assets" if source == "assets" else "builders"]
+    with connect(write=True) as con:
+        con.execute("BEGIN")
+        try:
+            con.execute(SOURCE_TABLES)
+            rid = con.execute("SELECT coalesce(max(run_id), 0) + 1 FROM source_runs").fetchone()[0]
+            con.execute("INSERT INTO source_runs VALUES (?, ?, ?, ?)", [rid, dt.datetime.now(dt.UTC), source, scope])
+            if rows:
+                batch = pa.Table.from_pylist([_encode(dict(row, run_id=rid)) for row in rows], schema=schema)
+                con.register("batch", batch)
+                con.execute(f"INSERT INTO {table} BY NAME SELECT * FROM batch")
+                con.unregister("batch")
+            con.execute("COMMIT")
+        except BaseException:
+            con.execute("ROLLBACK")
+            raise
+    return rid
+
+
+LATEST_RUNS = "(SELECT max(run_id) AS run_id FROM source_runs GROUP BY source, scope)"
+
+
+def _current(table: str) -> str:
+    """Rows of the latest run per (source, scope). Scopes can overlap (an organization and
+    one of its projects, all Dataform regions and one region), so each resource is kept once,
+    from its newest run."""
+    return (f"(SELECT * FROM {table} JOIN {LATEST_RUNS} USING (run_id) "
+            f"QUALIFY row_number() OVER (PARTITION BY name ORDER BY run_id DESC) = 1)")
+
+
+def _has_sources(con) -> bool:
+    return con.execute("SELECT count(*) FROM duckdb_tables() WHERE table_name = 'source_runs'").fetchone()[0] > 0
+BUILDER_COLUMNS = "kind, name, display_name, target, target_from, dependencies, schedule, state, location, updated"
+
+
+def _builder(r, sql_chars: int | None = 1000) -> dict:
+    out = dict(zip([c.strip() for c in BUILDER_COLUMNS.split(",")], r[:10]))
+    out["updated"] = _iso(out["updated"])
+    out["dependencies"] = out["dependencies"] or []
+    if sql_chars != 0:
+        out["sql"] = r[10] if sql_chars is None or r[10] is None else r[10][:sql_chars]
+    return out
+
+
+def lineage(con, fqn: str) -> dict:
+    """Builders that write this table, and builders that read it. Empty when none were harvested."""
+    if not _has_sources(con):
+        return {"built_by": [], "read_by": []}
+    rows = con.execute(f"""
+        SELECT {BUILDER_COLUMNS}, sql, target = $fqn AS writes FROM {_current("builders")}
+        WHERE target = $fqn OR list_contains(dependencies, $fqn) ORDER BY kind, name""", {"fqn": fqn}).fetchall()
+    return {"built_by": [_builder(r) for r in rows if r[11]],
+            "read_by": [_builder(r, sql_chars=0) for r in rows if not r[11]]}
+
+
+def search_builders(con, q: str = "", limit: int = 50, offset: int = 0) -> dict:
+    """Literal substring search over builder names, targets, dependencies and SQL."""
+    q = text(q, "q", empty=True).strip()
+    integer(limit, "limit", 1, SEARCH_LIMIT)
+    integer(offset, "offset", 0, 1_000_000)
+    if not _has_sources(con):
+        return {"items": [], "next_offset": None}
+    rows = con.execute(f"""
+        SELECT {BUILDER_COLUMNS}, sql FROM {_current("builders")}
+        WHERE $q = '' OR contains(lower(name), lower($q)) OR contains(lower(coalesce(display_name, '')), lower($q))
+              OR contains(lower(coalesce(target, '')), lower($q)) OR contains(lower(coalesce(sql, '')), lower($q))
+              OR contains(lower(array_to_string(dependencies, ' ')), lower($q))
+        ORDER BY target NULLS LAST, name LIMIT $limit OFFSET $offset""",
+        {"q": q, "limit": limit + 1, "offset": offset}).fetchall()
+    return {"items": [_builder(r, sql_chars=300) for r in rows[:limit]],
+            "next_offset": offset + limit if len(rows) > limit else None}
+
+
+def search_assets(con, q: str = "", asset_type: str = "", limit: int = 50, offset: int = 0) -> dict:
+    """Literal substring search over discovered resources; asset_type filters by substring too."""
+    q = text(q, "q", empty=True).strip()
+    asset_type = text(asset_type, "asset_type", empty=True).strip()
+    integer(limit, "limit", 1, SEARCH_LIMIT)
+    integer(offset, "offset", 0, 1_000_000)
+    if not _has_sources(con):
+        return {"items": [], "next_offset": None}
+    rows = con.execute(f"""
+        SELECT asset_type, name, display_name, description, location, labels, updated, state
+        FROM {_current("assets")}
+        WHERE ($type = '' OR contains(lower(asset_type), lower($type)))
+          AND ($q = '' OR contains(lower(name), lower($q)) OR contains(lower(coalesce(display_name, '')), lower($q))
+               OR contains(lower(coalesce(description, '')), lower($q)))
+        ORDER BY asset_type, name LIMIT $limit OFFSET $offset""",
+        {"q": q, "type": asset_type, "limit": limit + 1, "offset": offset}).fetchall()
+    names = ["asset_type", "name", "display_name", "description", "location", "labels", "updated", "state"]
+    return {"items": [{k: _decode(k, v) for k, v in zip(names, r)}
+                      for r in rows[:limit]],
+            "next_offset": offset + limit if len(rows) > limit else None}
 
 
 def _encode(row: dict) -> dict:
@@ -383,6 +511,7 @@ def describe(con, fqn: str) -> dict:
     out["columns"] = [dict(zip(names, c)) for c in cols]
     out["full_scan_usd"] = full_scan_usd(out["type"], out["num_bytes"])
     out["notes"] = _notes(out, out["columns"])
+    out.update(lineage(con, fqn))
     out["source"] = "catalog (tables.get, free)"
     return out
 

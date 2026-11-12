@@ -9,6 +9,10 @@
   sounding column-costs <project.dataset.table>   # one free dry run per column
   sounding estimate "<sql>"            # free dry run
   sounding preview <project.dataset.table>        # free tabledata.list
+  sounding harvest-builders <project>  # scheduled queries, transfers, Dataform (free admin APIs)
+  sounding builders [text]             # search what builds tables
+  sounding discover projects/<id>      # Cloud Asset Inventory: data resources (free)
+  sounding assets [text] [--type bucket]
   sounding cost-report [--hours 24]    # jobs this identity ran in the job project, with billed bytes
   sounding query-opportunities --location US  # preview a capped workload scan
   sounding query-report [report_id]    # reopen a saved workload report, locally
@@ -37,6 +41,18 @@ def _main() -> None:
     sub.add_parser("column-costs", help="per-column scan bytes via dry runs").add_argument("table")
     sub.add_parser("estimate", help="dry-run a query").add_argument("sql")
     sub.add_parser("preview", help="sample rows via tabledata.list").add_argument("table")
+    hb = sub.add_parser("harvest-builders", help="scheduled queries, transfers and Dataform actions for a project")
+    hb.add_argument("project")
+    hb.add_argument("--transfer-location", action="append", dest="transfer_locations",
+                    help="transfer config location, repeatable (default: us and eu)")
+    hb.add_argument("--dataform-location", default="-", help="Dataform region (default: all)")
+    sub.add_parser("builders", help="search harvested builders").add_argument("q", nargs="?", default="")
+    disc = sub.add_parser("discover", help="list data resources with Cloud Asset Inventory")
+    disc.add_argument("scope", help="projects/ID, folders/NUMBER or organizations/NUMBER")
+    disc.add_argument("--type", action="append", dest="types", help="asset type to search, repeatable")
+    assets = sub.add_parser("assets", help="search discovered resources")
+    assets.add_argument("q", nargs="?", default="")
+    assets.add_argument("--type", default="", help="filter asset types by substring, e.g. bucket")
     report = sub.add_parser("cost-report", help="jobs run in the job project and what BigQuery billed (free)")
     report.add_argument("--hours", type=int, default=24, help="window to report, up to 4320 (180 days)")
     from . import workload
@@ -116,6 +132,34 @@ def _main() -> None:
         print(json.dumps(bq.dry_run(a.sql), indent=2))
     elif a.cmd == "preview":
         print(json.dumps(bq.preview(a.table), indent=2, default=str))
+    elif a.cmd == "harvest-builders":
+        from . import sources
+        result = sources.builders(a.project, tuple(a.transfer_locations or sources.DEFAULT_TRANSFER_LOCATIONS),
+                                  a.dataform_location, for_terminal("builders"))
+        print(json.dumps({k: v for k, v in result.items() if k != "receipt"}, indent=2))
+        print(_receipt_line(result["receipt"]), file=sys.stderr)
+    elif a.cmd == "discover":
+        from . import sources
+        result = sources.discover(a.scope, tuple(a.types) if a.types else sources.DATA_ASSET_TYPES)
+        print(json.dumps({k: v for k, v in result.items() if k != "receipt"}, indent=2))
+        print(_receipt_line(result["receipt"]), file=sys.stderr)
+    elif a.cmd == "builders":
+        offset = 0
+        while offset is not None:
+            with catalog.connect() as con:
+                page = catalog.search_builders(con, a.q, offset=offset)
+            for r in page["items"]:
+                deps = f"  <- {', '.join(r['dependencies'][:3])}{' …' if len(r['dependencies']) > 3 else ''}" if r["dependencies"] else ""
+                print(f"{r['kind']:<22} {r['target'] or '(no target)'}  [{r['display_name'] or r['name']}]{deps}")
+            offset = page["next_offset"]
+    elif a.cmd == "assets":
+        offset = 0
+        while offset is not None:
+            with catalog.connect() as con:
+                page = catalog.search_assets(con, a.q, a.type, offset=offset)
+            for r in page["items"]:
+                print(f"{r['asset_type']:<40} {r['location'] or '':<14} {r['name'].removeprefix('//')}")
+            offset = page["next_offset"]
     elif a.cmd == "cost-report":
         print(json.dumps(bq.cost_report(a.hours), indent=2))
     elif a.cmd == "query-opportunities":
