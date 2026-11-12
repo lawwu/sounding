@@ -1,6 +1,6 @@
 [project]
 name = "sounding"
-version = "0.4.1"
+version = "0.5.0"
 description = "Take a sounding before you dive: a cost-aware BigQuery metadata catalog for people and agents."
 readme = "README.md"
 license = "MIT"

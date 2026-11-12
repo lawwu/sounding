@@ -253,4 +253,4 @@ def test_prototype_tables_leave_the_schema_version_alone(monkeypatch):
         assert catalog.search_builders(con)["items"] == [] == catalog.search_assets(con)["items"]
     sources.builders(P)
     with catalog.connect() as con:
-        assert con.execute("SELECT version FROM catalog_meta").fetchone()[0] == catalog.SCHEMA_VERSION == 3
+        assert con.execute("SELECT version FROM catalog_meta").fetchone()[0] == catalog.SCHEMA_VERSION

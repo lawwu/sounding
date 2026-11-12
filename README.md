@@ -2,7 +2,8 @@
 
 Sailors took a sounding to measure the water's depth before going in. Sounding does the same
 for BigQuery: it shows what data exists, how big and fresh it is, how tables are shaped, and
-what a query may cost, all without running a paid query.
+what a query may cost, all without running a paid query. An optional workload scan
+also identifies costly query patterns worth investigating, under an explicit byte cap.
 
 It harvests metadata into a local DuckDB catalog using only BigQuery's free calls. People
 read the catalog from the CLI and agents read it over MCP.
@@ -19,8 +20,8 @@ Sounding answers each question from the cheapest source that can.
 | REST `routines.list` / `routines.get` | Functions and procedures: type, language, signature, return type, description, body | $0 (API quota) |
 | `tabledata.list` | Sample rows (tables only, not views) | $0 |
 | Dry run | Estimated bytes, reported referenced tables, and estimate limitations | $0 |
-| REST `jobs.list` | Jobs this identity ran in the job project, with what BigQuery billed (`sounding cost-report`) | $0 (API quota) |
-| INFORMATION_SCHEMA | Per-partition details, job history | 10 MB minimum for on-demand queries; capacity queries consume slots; never cached: **not harvested** (the cost guard can still dry-run it for free) |
+| REST `jobs.list` / `jobs.get` | Cost receipts and individual query execution details (`cost-report`, `inspect-job`) | $0 (API quota) |
+| INFORMATION_SCHEMA | Regional job history grouped into optimization candidates (`query-opportunities`) | **Opt-in only**, byte-capped; 10 MB minimum on demand, capacity queries consume slots, never cached. The metadata harvester does not use it. |
 | Sampled profiles | `TABLESAMPLE` + `APPROX_*` | Billed: **not used yet** (planned as opt-in, capped, approved) |
 
 Two free tricks come from dry runs:
@@ -93,8 +94,9 @@ in this coordination and must close their connections before Sounding opens it.
 
 ### Cost receipts
 
-Every action that calls BigQuery returns a `receipt` showing it cost nothing, and
+Free BigQuery actions return a `receipt` showing the evidence that they cost nothing, and
 `sounding cost-report` shows the jobs this identity ran in the job project, with what was billed.
+Opt-in workload scans return their actual job ID, billed bytes and slot time instead.
 
 - **Dry runs** (estimate, cost guard, column costs): the receipt copies three fields
   from BigQuery's own response. `dry_run_confirmed` is `configuration.dryRun`,
@@ -107,12 +109,91 @@ Every action that calls BigQuery returns a `receipt` showing it cost nothing, an
 - **`sounding cost-report`** lists the jobs this identity ran in the job project over
   a window: 24 hours by default, up to the 180 days BigQuery keeps. It uses the free
   `jobs.list` call and shows each job's billed bytes and list price.
-  - None of Sounding's calls creates a job, so a window in which you only used
-    Sounding shows **0 jobs**. That is evidence nothing in it could have been billed
-    to that project.
+  - Sounding's metadata, preview and dry-run calls create no jobs. A window using
+    only these operations shows **0 jobs**. Opt-in workload scans do create jobs
+    and appear in this report.
   - A query run by any other tool in that project appears with its own billed bytes.
   - It does not show jobs billed to other projects or by other identities, and it
     prices at list rate, so your Cloud Billing report remains the final word.
+
+### Find queries worth optimizing
+
+`query-opportunities` is available through the CLI and MCP. It scans job metadata,
+groups repeated executions by BigQuery's normalized query hash, and ranks the
+groups by **total billed bytes** or **total slot time**. This catches a smaller query
+run thousands of times as well as a single large query. Each candidate includes up
+to three representative job IDs and evidence-based investigation suggestions.
+
+```bash
+# Free preview: shows the fixed metadata SQL, scope, estimate and cap.
+uv run sounding query-opportunities --location US --hours 168
+
+# Execute one capped metadata scan and save its report locally.
+uv run sounding query-opportunities --location US --hours 168 --allow-billed
+
+# Project-wide scope; slot-time ranking is useful for capacity workloads.
+uv run sounding query-opportunities --location EU --project my-project \
+  --scope project --rank-by slot_ms --allow-billed
+
+# Reopen the latest saved report (or pass a report_id), with no BigQuery call.
+uv run sounding query-report
+
+# Free inspection of a representative job; SQL text is explicitly opt-in.
+uv run sounding inspect-job JOB_ID --location US --include-sql
+```
+
+The default scope is the current identity's jobs in `SOUNDING_JOB_PROJECT` (or the
+credentials' default project). `--project` selects the project whose history is
+read; the monitoring query itself still runs in the job project. Project scope
+requires `bigquery.jobs.listAll`, commonly granted by `roles/bigquery.resourceViewer`,
+and execution requires `bigquery.jobs.create` in the job project. Location is
+required: `US`, `EU` and individual regions are distinct scopes.
+
+Scans preview first and execute only with `--allow-billed`. The default
+`--max-bytes-billed` is **104857600 (100 MiB)**, with an allowed range of 10 MiB to
+1 GiB. BigQuery enforces it on execution; a preview over the cap is blocked.
+Unknown dry-run estimates stay unknown and still require explicit opt-in and the
+execution cap. The cap limits on-demand scan bytes, **not capacity charges**. A
+60-second best-effort job timeout is also requested. Sounding does not submit a
+replacement job after execution failure or widen the cap automatically.
+
+Candidates qualify when a group's known total reaches `--min-billed-bytes`
+(default 1 GiB), `--min-slot-ms` (default 60000 slot milliseconds), or has a BigQuery
+resource/performance warning. The default is the top 20 groups (`--limit`, maximum
+100), over seven days (`--hours`, maximum 4320). Grouping happens before the limit;
+`total_candidates` and `truncated` describe the result cutoff.
+
+The report flags resource warnings, slot contention, insufficient shuffle capacity,
+high-cardinality joins and partition skew. `inspect-job` adds stage-level shuffle
+spill, large row expansion, labels (including dbt attribution when present), and
+referenced tables. Use the harvested schemas and free dry runs to evaluate possible
+rewrites. These are investigation leads, not proof that a query is wasteful or a
+promise of savings. Slot contention may call for workload scheduling or capacity
+changes rather than a SQL rewrite.
+
+Only successful, completed, non-cached query jobs created in the window count.
+Script parents are excluded to avoid counting their children twice, and monitoring
+jobs are excluded by label. Jobs without a normalized hash stay separate. Missing
+metrics remain `null`; `known_*` totals are partial when corresponding
+`missing_*_jobs` counts are positive. Dollar figures are **US on-demand scan
+equivalents**, not capacity charges or invoices; model training is left unpriced.
+An empty result does not establish zero usage: check scope, region and thresholds.
+
+Reports are stored in the local catalog with their scope, timestamps and receipts;
+`query-report` never refreshes them. The latest report can belong to a different
+project or region, so use its `report_id` for an exact lookup. Business SQL and user
+emails are not selected or persisted by the scan. `inspect-job --include-sql` prints
+SQL without saving it; SQL and labels may contain sensitive values. A failed scan
+returns `status: failed` with available billing evidence; a blocked scan returns
+`status: blocked`. The CLI exits with code 2 for either, retaining the JSON response.
+
+The design draws on Google's [BigQuery observability guidance](https://github.com/google/skills/tree/main/skills/cloud/bigquery-observability)
+and [optimization guidance](https://github.com/google/skills/tree/main/skills/cloud/bigquery-optimization),
+and the recurring-query and materialization-candidate reports in
+[dbt-bigquery-monitoring](https://github.com/bqbooster/dbt-bigquery-monitoring).
+Sounding uses these patterns directly without requiring a dbt deployment or billing
+export. See Google's [JOBS schema](https://docs.cloud.google.com/bigquery/docs/information-schema-jobs)
+for scope, permissions, hash behavior and metric limitations.
 
 ### What a harvest keeps
 
@@ -181,12 +262,15 @@ sounding assets --type bucket
 
 ### Catalog upgrades
 
-This version uses catalog schema 3. The prototype builders and discovery tables are
-added the first time `harvest-builders` or `discover` writes, without changing the
-schema version, so released Sounding still opens the catalog. A schema 2 catalog is
-upgraded in place the first time any Sounding command opens it: the new fields are added, existing snapshots show
-them as unknown until the next harvest, and nothing needs re-harvesting. The upgrade
-runs in one transaction, so a failure leaves the catalog as it was.
+This version uses catalog schema 4. Schema 2 and 3 catalogs are upgraded in place
+the first time any Sounding command opens them. Schema 3 adds richer metadata;
+schema 4 adds saved workload reports. Existing snapshots are preserved, and older
+metadata fields stay unknown until the next harvest. Each migration runs in one
+transaction, so a failed step rolls back without changing its starting schema.
+
+The prototype builders and discovery tables are added the first time
+`harvest-builders` or `discover` writes, without changing the schema version, so
+released Sounding still opens the catalog.
 
 Schema 1 catalogs (Sounding before 0.1.0) can't be converted reliably (timezone-less
 timestamps, alias-keyed snapshots). The first time Sounding opens one, it renames it
@@ -228,6 +312,9 @@ discarded when the selection changes, and catalog text is escaped before display
 | --- | --- |
 | `search_catalog`, `describe_table`, `describe_dataset`, `search_routines`, `describe_routine` | Never |
 | `preview_rows`, `estimate_query_cost`, `cost_report` | Yes, free calls only; each result carries a receipt or job list |
+| `inspect_query_job` | Yes, free `jobs.get`; SQL is opt-in |
+| `query_opportunities` | Free preview by default; `allow_billed=true` executes one byte-capped metadata query |
+| `query_opportunity_report` | Never; reads a saved report by ID, or the latest across all scopes |
 
 `search_catalog(q="", limit=50, offset=0)` returns `{items, next_offset}`; pass
 `next_offset` as `offset` to continue. Limits are 1–100 tables and 20 matching paths
@@ -263,8 +350,9 @@ and the Python MCP SDK is the reference implementation.
 4. Join inference from column name, type and value overlap
 5. ✅ Search UI (`sounding ui`) with column costs, preview and a dry-run cost guard; next: an overview page
 6. Opt-in billed profiling behind a byte cap and approval, with results cached in the catalog
-7. ✅ Keep the whole table resource (keys, partition guidance, storage, labels, policy tags), dataset settings and routines; next: BigQuery ML models, row-access policy metadata, and opt-in job history
-8. Prototype: builders (scheduled queries, transfers, Dataform) and Cloud Asset discovery; next: Looker LookML
+7. ✅ Keep the whole table resource (keys, partition guidance, storage, labels, policy tags), dataset settings and routines; next: BigQuery ML models and row-access policy metadata
+8. ✅ Opt-in query opportunity scans, saved reports and free job inspection; next: workload trends and a UI for reports
+9. Prototype: builders (scheduled queries, transfers, Dataform) and Cloud Asset discovery; next: Looker LookML
 
 ## Stability
 
@@ -278,8 +366,9 @@ any minor release may break things, and its release notes say so when it does. F
   allowance for added fields.
 - **The catalog file:** every 1.x release opens and upgrades every 1.x catalog in place.
   Query it through Sounding; its table layout is not part of the interface.
-- **The cost contract:** Sounding makes only free BigQuery calls, every call that reaches
-  BigQuery reports a receipt, and an unknown cost is reported as unknown, never as zero.
+- **The cost contract:** Sounding uses free calls by default. Executing fixed workload
+  monitoring SQL requires explicit opt-in and a byte cap; user-supplied SQL remains
+  dry-run only. Results carry cost evidence, and unknown cost remains unknown, never zero.
 
 **The Python modules are internal.** `sounding.bq`, `sounding.catalog`, `sounding.ui`,
 `sounding.mcp_server` and the rest may change in any release, including patch releases,

@@ -14,6 +14,9 @@
   sounding discover projects/<id>      # Cloud Asset Inventory: data resources (free)
   sounding assets [text] [--type bucket]
   sounding cost-report [--hours 24]    # jobs this identity ran in the job project, with billed bytes
+  sounding query-opportunities --location US  # preview a capped workload scan
+  sounding query-report [report_id]    # reopen a saved workload report, locally
+  sounding inspect-job <job_id> --location US  # free execution details
   sounding mcp                         # stdio MCP server for agents
   sounding ui [--port 8765] [--open]   # local search UI
 """
@@ -52,6 +55,25 @@ def _main() -> None:
     assets.add_argument("--type", default="", help="filter asset types by substring, e.g. bucket")
     report = sub.add_parser("cost-report", help="jobs run in the job project and what BigQuery billed (free)")
     report.add_argument("--hours", type=int, default=24, help="window to report, up to 4320 (180 days)")
+    from . import workload
+    opportunities = sub.add_parser("query-opportunities", help="find recurring costly queries; free preview unless --allow-billed")
+    opportunities.add_argument("--location", required=True, help="BigQuery location, e.g. US or europe-west1")
+    opportunities.add_argument("--project", help="project whose job history to scan; defaults to the job project")
+    opportunities.add_argument("--scope", choices=["user", "project"], default="user")
+    opportunities.add_argument("--hours", type=int, default=168, help="lookback, up to 4320 hours")
+    opportunities.add_argument("--rank-by", choices=list(workload.RANKS), default="billed_bytes")
+    opportunities.add_argument("--limit", type=int, default=20)
+    opportunities.add_argument("--min-billed-bytes", type=int, default=workload.DEFAULT_MIN_BILLED_BYTES)
+    opportunities.add_argument("--min-slot-ms", type=int, default=workload.DEFAULT_MIN_SLOT_MS)
+    opportunities.add_argument("--max-bytes-billed", type=int, default=workload.DEFAULT_MAX_BYTES,
+                               help="metadata scan byte cap: default 100 MiB, maximum 1 GiB")
+    opportunities.add_argument("--allow-billed", action="store_true", help="execute the capped metadata scan and save the report")
+    sub.add_parser("query-report", help="read a saved query opportunity report without calling BigQuery").add_argument("report_id", nargs="?")
+    inspect = sub.add_parser("inspect-job", help="inspect query execution details using free jobs.get")
+    inspect.add_argument("job_id")
+    inspect.add_argument("--location", required=True)
+    inspect.add_argument("--project")
+    inspect.add_argument("--include-sql", action="store_true", help="include query text, which may contain sensitive literals")
     sub.add_parser("mcp", help="run the stdio MCP server")
     ui = sub.add_parser("ui", help="run the local search UI")
     ui.add_argument("--port", type=int, default=8765)
@@ -140,6 +162,16 @@ def _main() -> None:
             offset = page["next_offset"]
     elif a.cmd == "cost-report":
         print(json.dumps(bq.cost_report(a.hours), indent=2))
+    elif a.cmd == "query-opportunities":
+        result = bq.query_opportunities(**{k: v for k, v in vars(a).items() if k != "cmd"})
+        print(json.dumps(result, indent=2))
+        if result["status"] in ("blocked", "failed"):
+            raise SystemExit(2)
+    elif a.cmd == "query-report":
+        with catalog.connect() as con:
+            print(json.dumps(catalog.workload_report(con, a.report_id), indent=2))
+    elif a.cmd == "inspect-job":
+        print(json.dumps(bq.inspect_query_job(a.job_id, a.location, project=a.project, include_sql=a.include_sql), indent=2))
 
 
 def _receipt_line(r: dict) -> str:
