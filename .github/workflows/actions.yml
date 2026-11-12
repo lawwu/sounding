@@ -1,0 +1,39 @@
+# Two checks on the workflows themselves, on every pull request and push to main:
+# - "Actions lock" fails when a workflow uses an action that .github/workflows/actions.lock
+#   doesn't record, or when a recorded commit no longer matches upstream (a moved tag, a
+#   rewritten or recreated repository). After changing a workflow, relock with
+#   `gh actions-lock` and commit actions.lock with it.
+# - "zizmor" lints the workflows: unpinned actions, broad token permissions, credentials
+#   left on disk, template injection, actions with known vulnerabilities, impostor commits.
+name: actions
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  lockfile:
+    name: Actions lock
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - run: gh extension install github/gh-actions-lock --pin v0.4.1
+      - run: gh actions-lock --verify
+
+  zizmor:
+    name: zizmor
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - uses: zizmorcore/zizmor-action@v0.8.1
+        with:
+          version: 1.32.0
+          advanced-security: false # findings fail the job, as annotations on the pull request
+          annotations: true
