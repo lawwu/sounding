@@ -39,6 +39,46 @@ function harness() {
   return {element, context, pending, resolve, run};
 }
 const table = fqn => ({fqn, type: 'TABLE', columns: [], num_rows: 1, num_bytes: 8, full_scan_usd: 0.00006});
+
+test('offender ranking switches metrics locally and labels missing totals', async () => {
+  const h = harness();
+  h.context.report = {jobs:[],query_groups:[
+    {representative:{job_id:'scan-heavy'},executions:2,known_billed_bytes:500,known_slot_ms:10,unknown_billed:0,unknown_slots:0},
+    {representative:{job_id:'slot-heavy'},executions:8,known_billed_bytes:100,known_slot_ms:900,unknown_billed:1,unknown_slots:0}]};
+  h.run('renderCostRanking(report, viewSeq)');
+  let html = h.element('#offenders').innerHTML;
+  assert.ok(html.indexOf('scan-heavy') < html.indexOf('slot-heavy'));
+  assert.match(html, /1 unknown/);
+  h.element('#offender-rank').value = 'slots'; h.run('renderCostRanking(report, viewSeq)');
+  html = h.element('#offenders').innerHTML;
+  assert.ok(html.indexOf('slot-heavy') < html.indexOf('scan-heavy'));
+  assert.equal(h.pending.filter(p => p.url === '/api/inspect-job').length, 0);
+});
+
+test('cost report queries are fetched on demand, escaped, and reused when reopened', async () => {
+  const h = harness();
+  h.run('reportPage()');
+  h.context.button = h.element('#query-button');
+  const load = h.run('showReportQuery({job_id:"j",project:"p",location:"EU"}, 0, button, viewSeq)');
+  const req = h.resolve('/api/inspect-job', {sql:'SELECT "<script>"',sql_truncated:true});
+  assert.deepEqual(JSON.parse(req.options.body), {job_id:'j',project:'p',location:'EU',include_sql:true});
+  await load;
+  assert.match(h.element('#report-query-0').innerHTML, /&lt;script&gt;/);
+  assert.match(h.element('#report-query-0').innerHTML, /truncated/);
+  h.run('showReportQuery({}, 0, button, viewSeq)');
+  assert.equal(h.element('#report-query-row-0').hidden, true);
+  h.run('showReportQuery({}, 0, button, viewSeq)');
+  assert.equal(h.element('#report-query-row-0').hidden, false);
+  assert.equal(h.pending.filter(p => p.url === '/api/inspect-job').length, 1);
+});
+
+test('late cost report SQL cannot overwrite another page', async () => {
+  const h = harness(); h.run('reportPage()'); h.context.button = h.element('#query-button');
+  const load = h.run('showReportQuery({job_id:"j",project:"p",location:"US"}, 0, button, viewSeq)');
+  h.run('reportPage()'); h.element('#report-query-0').innerHTML = 'new report';
+  h.resolve('/api/inspect-job', {sql:'old query'}); await load;
+  assert.equal(h.element('#report-query-0').innerHTML, 'new report');
+});
 async function show(h, fqn) {
   const promise = h.run(`open(${JSON.stringify(fqn)})`);
   h.resolve('/api/table?fqn=' + encodeURIComponent(fqn), table(fqn));

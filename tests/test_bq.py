@@ -243,6 +243,7 @@ def test_cost_report_sums_bigquery_billed_bytes(monkeypatch):
     c.list_jobs.return_value = [job_listing("a", billed=str(10 * 2**20), statementType="SELECT"),
                                 job_listing("b", billed="0", cacheHit=True)]
     r = bq.cost_report(1)
+    assert all(row["project"] == "p" and "location" in row for row in r["jobs"])
     assert r["job_count"] == 2 and r["billed_bytes"] == 10 * 2**20
     assert r["usd_on_demand"] == catalog.usd(10 * 2**20)
     assert r["jobs"][0]["created"].endswith("+00:00") and r["jobs"][1]["cache_hit"] is True
@@ -261,6 +262,24 @@ def test_cost_report_bounds_and_truncation(monkeypatch):
     c.list_jobs.return_value = [job_listing(str(i)) for i in range(3)]
     r = bq.cost_report(1)
     assert r["truncated"] and r["job_count"] == 2 and any("Use a shorter window" in w for w in r["warnings"])
+
+
+def test_cost_report_groups_repeated_sql_and_excludes_children(monkeypatch):
+    c = fake_client(monkeypatch)
+    a, b, other, child, missing = [job_listing(name, billed=cost) for name, cost in [("a","100"),("b","200"),("other","250"),("child","999"),("missing",None)]]
+    other._properties["configuration"]["query"]["query"] = "SELECT 2"
+    child._properties["statistics"]["parentJobId"] = "a"
+    missing._properties["configuration"]["query"].pop("query")
+    c.list_jobs.return_value = [a,b,other,child,missing]
+    result = bq.cost_report()
+    top = result["query_groups"][0]
+    assert top["executions"] == 2 and top["known_billed_bytes"] == 300
+    assert top["representative"]["job_id"] == "b"
+    assert len(result["query_groups"]) == 3 and result["query_jobs"] == 4
+    assert result["query_groups"][-1]["unknown_billed"] == 1
+    assert result["billed_bytes"] is None
+    assert "SELECT 1" not in json.dumps(result)
+    c.query.assert_not_called()
 
 
 def test_column_costs_qualify_and_escape_identifiers(seed, monkeypatch):
@@ -345,6 +364,7 @@ def test_table_resource_fields_are_captured(monkeypatch):
         t = catalog.describe(con, "p.d.orders")
         plain = catalog.describe(con, "p.d.plain")
         resource = json.loads(con.execute("SELECT resource FROM tables WHERE fqn = 'p.d.orders'").fetchone()[0])
+        stored_schema = json.loads(con.execute("SELECT schema FROM schemas JOIN tables USING(schema_hash) WHERE fqn='p.d.orders'").fetchone()[0])
     assert t["partitioning"] == "DAY:day" and t["require_partition_filter"] is True
     assert t["partition_expiration_ms"] == 86_400_000 and t["num_partitions"] == 32
     assert t["primary_key"] == ["id"]
@@ -357,7 +377,7 @@ def test_table_resource_fields_are_captured(monkeypatch):
     assert any("must filter on the partition column" in n for n in t["notes"])
     assert any("policy tags" in n and "email" in n for n in t["notes"])
     assert any("not enforced" in n for n in t["notes"])
-    assert "resource" not in t and resource["schema"]["fields"] == schema and resource["numPartitions"] == "32"
+    assert "resource" not in t and "schema" not in resource and stored_schema["fields"] == schema and resource["numPartitions"] == "32"
     # Absent fields are unknown (None), never zero or False.
     assert plain["storage"] is None and plain["num_partitions"] is None
     assert plain["require_partition_filter"] is None and plain["primary_key"] is None and plain["notes"] == []

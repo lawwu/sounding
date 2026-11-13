@@ -26,6 +26,25 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import re
+from pathlib import Path
+
+
+def import_list(values, paths):
+    """Combine repeatable arguments and text/JSON list files without duplicates."""
+    items = []
+    for value in values:
+        items.extend(re.split(r"[\s,]+", value.strip()))
+    for path in paths:
+        content = Path(path).read_text().strip()
+        if content.startswith("["):
+            entries = json.loads(content)
+            if not isinstance(entries, list) or any(not isinstance(v, str) for v in entries):
+                raise ValueError("Import JSON must be an array of names.")
+            items.extend(import_list(entries, []))
+        else:
+            items.extend(import_list([line.split("#", 1)[0] for line in content.splitlines()], []))
+    return list(dict.fromkeys(item for item in items if item))
 
 
 def _main() -> None:
@@ -37,6 +56,9 @@ def _main() -> None:
     refresh_cmd = sub.add_parser("refresh", help="refresh datasets or whole projects with progress (free metadata calls)")
     refresh_cmd.add_argument("datasets", nargs="*")
     for command in (harvest_cmd, refresh_cmd):
+        command.add_argument("--dataset", action="append", default=[], help="dataset name or comma-separated list; repeat to combine")
+        command.add_argument("--projects-file", action="append", default=[], help="project IDs from a text list or JSON array; repeatable")
+        command.add_argument("--datasets-file", action="append", default=[], help="dataset names from a text list or JSON array; repeatable")
         command.add_argument("--project", action="append", default=[], help="discover and import a whole project; repeat for multiple projects")
         command.add_argument("--include-preview-rows", action="store_true",
                              help="save up to 10 rows / 256 KB per table; WARNING: can add a material delay and stores actual data locally")
@@ -87,6 +109,12 @@ def _main() -> None:
     ui.add_argument("--port", type=int, default=8765)
     ui.add_argument("--open", action="store_true", help="open it in your browser")
     a = p.parse_args()
+    if a.cmd in ("harvest", "refresh"):
+        try:
+            a.datasets = import_list(a.datasets + a.dataset, a.datasets_file)
+            a.project = import_list(a.project, a.projects_file)
+        except (OSError, ValueError) as error:
+            p.error(f"Cannot read import targets: {error}")
     if a.cmd == "harvest" and not (a.datasets or a.project):
         p.error("harvest requires at least one dataset or --project PROJECT_ID")
 
