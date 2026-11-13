@@ -5,5 +5,5 @@ file and the free-calls-only cost contract; see "Stability" in the README. The P
 modules in this package are internal and may change in any release.
 """
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 __all__ = ["__version__"]
