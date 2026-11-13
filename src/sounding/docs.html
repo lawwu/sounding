@@ -125,4 +125,15 @@ table_query_history(table="my-project.analytics.orders", days=30)</pre>
     </tbody></table></div>
     <p>Refresh status is idle, pending, running, complete, partial or failed. Per-dataset outcomes and sanitized messages explain failures. Progress totals grow as metadata is discovered. A new server does not resume interrupted work.</p>
   </section>
+
+<section><h3>Smaller catalogs and resumable imports</h3>
+<p>Choose <b>Inventory only</b> in Refresh metadata to save table names, types, sizes and timestamps. Schemas, view SQL and auxiliary metadata are omitted. Use <b>Load full table metadata</b> on a table when needed. Column search cannot cover unloaded schemas.</p>
+<pre>sounding harvest --project tenant-one --inventory-only --exclude-dataset 'stage*'
+sounding load-metadata tenant-one.analytics.events
+sounding harvest --project tenant-one --inventory-only --exclude-dataset 'stage*' --resume</pre>
+<p>Repeat <code>--include-dataset</code> and <code>--exclude-dataset</code> for glob patterns matching dataset names or project.dataset. Exclusions win. Hidden datasets require <code>--include-hidden</code>. Receipts show filters and skipped datasets; old catalog data is retained.</p>
+<p><code>--project-concurrency</code> accepts 1–4 (default 1). Each project keeps the existing per-dataset request limits. Project imports save a checkpoint beside the catalog; resume skips completed datasets and retries unfinished ones. Start a new run to discover newly added datasets. The UI provides <b>Resume last import</b>.</p>
+<p>HTTP <code>POST /api/refresh</code> and MCP <code>refresh_metadata</code> accept <code>inventory_only</code>, <code>include_datasets</code>, <code>exclude_datasets</code>, <code>include_hidden</code>, <code>project_concurrency</code> and <code>resume</code>. HTTP <code>POST /api/load-metadata</code> takes <code>fqn</code>; MCP <code>load_table_metadata</code> takes <code>table</code>.</p>
+<p>Catalog schema 7 shares flattened definitions and stores column costs against integer table snapshot IDs. Older versions cannot open upgraded catalogs. Separate compaction may be needed to reclaim physical disk space; no history is pruned automatically.</p></section>
+
 </div>

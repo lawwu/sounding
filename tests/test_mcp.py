@@ -77,7 +77,7 @@ def test_browse_refresh_and_history_tools(monkeypatch, seed):
     from sounding import refresh
     seed()
     started = []
-    monkeypatch.setattr(refresh.Manager, 'start', lambda self,datasets,projects: started.append((datasets,projects)) or {'status':'running'})
+    monkeypatch.setattr(refresh.Manager, 'start', lambda self,datasets,projects,**options: started.append((datasets,projects)) or {'status':'running'})
     async def check():
         app = create_server()
         schemas = {t.name:t.input_schema for t in await app.list_tools()}

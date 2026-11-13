@@ -46,13 +46,13 @@ def client() -> bigquery.Client:
     return bigquery.Client(project=JOB_PROJECT)
 
 
-def project_datasets(project: str) -> dict:
-    """Discover every visible, non-hidden dataset using the free paginated API."""
+def project_datasets(project: str, *, include_hidden=False) -> dict:
+    """Discover accessible datasets; hidden names require explicit inclusion."""
     workload.identifier(project, "project")
     c = client()
     datasets, unreachable = [], set()
     try:
-        for page in c.list_datasets(project=project, page_size=1000, timeout=30).pages:
+        for page in c.list_datasets(project=project, page_size=1000, timeout=30, **({"include_all": True} if include_hidden else {})).pages:
             unreachable.update((page._raw_page or {}).get("unreachable", []))
             datasets.extend(f"{d.project}.{d.dataset_id}" for d in page)
     finally:
@@ -239,7 +239,7 @@ def row_access_policies(c, table):
         return {"row_access_policies": None, "row_access_policies_status": status, "row_access_policies_message": message}
 
 
-def harvest(datasets: list[str], progress: Quiet | None = None, *, include_preview_rows: bool = False) -> dict:
+def harvest(datasets: list[str], progress: Quiet | None = None, *, include_preview_rows: bool = False, inventory_only: bool = False) -> dict:
     """Free metadata calls only, including models, row policies and cached recommendations.
 
     Datasets are crawled concurrently, each publishing its own snapshot, so a failure
@@ -247,6 +247,10 @@ def harvest(datasets: list[str], progress: Quiet | None = None, *, include_previ
     if any failed, the first error is raised once the others finish. Returns a receipt
     counting the get calls made. None of them is a job.
     """
+    if inventory_only:
+        if include_preview_rows:
+            raise SoundingError("Inventory mode cannot include preview rows; load a sample explicitly later.")
+        return harvest_inventory(datasets, progress)
     progress = progress or Quiet()
     # Fail early on unsupported catalogs, but release the connection before network I/O.
     with catalog.connect():
@@ -399,6 +403,73 @@ def harvest(datasets: list[str], progress: Quiet | None = None, *, include_previ
     return receipt | {"get_calls": counts, "coverage": coverage}
 
 
+
+INVENTORY_FIELDS = "tableReference,type,numRows,numBytes,creationTime,lastModifiedTime,location,expirationTime"
+
+
+def harvest_inventory(datasets, progress=None):
+    """Small tables.get partial responses: no schemas, view SQL, samples or auxiliary APIs."""
+    progress = progress or Quiet()
+    with catalog.connect():
+        pass
+    c = client()
+    coverage, calls = {}, 0
+    try:
+        for dataset in datasets:
+            ref = bigquery.DatasetReference.from_string(dataset, default_project=c.project)
+            ds = str(ref)
+            resource = c.get_dataset(ref).to_api_repr()
+            refs = [i.reference for i in c.list_tables(ds)]
+            progress.add(len(refs) + 1)
+            def get(r):
+                try:
+                    path = f"/projects/{quote(r.project, safe='')}/datasets/{quote(r.dataset_id, safe='')}/tables/{quote(r.table_id, safe='')}"
+                    result = c._call_api(retry=bigquery.DEFAULT_RETRY, method="GET", path=path,
+                                         query_params={"fields": INVENTORY_FIELDS}, timeout=30)
+                    # Also whitelist locally so a future API/library change cannot store full schemas.
+                    result = {k:v for k,v in result.items() if k in INVENTORY_FIELDS.split(',')}
+                    row, _ = table_record(result, ds)
+                    return row | {"resource": None, "metadata_level": "inventory", "preview_status": "not_requested",
+                                  "row_access_policies_status": "not_requested"}
+                except NotFound:
+                    return None
+                finally:
+                    progress.advance()
+            with ThreadPoolExecutor(GET_TABLE_WORKERS) as pool:
+                rows = [r for r in pool.map(get, refs) if r is not None]
+            info = dataset_record(resource, ds, "not_requested") | {"models_status": "not_requested"}
+            # Keep only small dataset identity/summary metadata in inventory mode.
+            info['resource'] = None
+            catalog.save_snapshot(ds, rows, [], info)
+            calls += len(refs)
+            coverage[ds] = {"status": "complete", "warnings": [], "metadata_level": "inventory"}
+            progress.advance()
+    finally:
+        c.close()
+        progress.close()
+    return free_api_receipt("datasets.get", "tables.list", "tables.get") | {
+        "get_calls": {"tables.get": calls}, "coverage": coverage, "metadata_level": "inventory",
+        "warnings": ["Schemas, view SQL, routines, models, row policies and recommendations were not requested."]}
+
+
+def load_table_metadata(fqn):
+    """Explicitly hydrate one inventory entry, refusing a concurrent dataset refresh."""
+    text(fqn, "table")
+    with catalog.connect() as con:
+        previous = catalog.describe(con, fqn)
+    c = client()
+    try:
+        remote = c.get_table(fqn)
+        row, columns = table_record(remote.to_api_repr(), previous['dataset'])
+        row.update(row_access_policies(c, remote))
+        row['metadata_level'] = 'full'
+        catalog.save_table_metadata(fqn, previous['snapshot_id'], row, columns)
+    finally:
+        c.close()
+    with catalog.connect() as con:
+        return catalog.describe(con, fqn) | {"receipt": free_api_receipt("tables.get", "rowAccessPolicies.list")}
+
+
 def dry_run_receipt(job) -> dict:
     """Evidence that a dry run cost nothing, copied from BigQuery's own response.
 
@@ -508,6 +579,8 @@ def column_costs(fqn: str, progress: Quiet | None = None) -> dict:
         table = catalog.describe(con, fqn)
     if table["type"] != "TABLE":
         raise SoundingError("Column costs require a native table.")
+    if table.get('metadata_level') == 'inventory':
+        raise SoundingError("Load full table metadata before computing column costs.")
     cols = [c["path"] for c in table["columns"] if "." not in c["path"]]
     source = f"FROM {quote_identifier(fqn)} AS sounding_source"
     where, partition_col, warnings = "", None, []
@@ -547,8 +620,10 @@ def column_costs(fqn: str, progress: Quiet | None = None) -> dict:
         con.execute("BEGIN")
         try:
             for col, size in out:
-                con.execute("UPDATE columns SET scan_bytes = ? WHERE snapshot_id = ? AND fqn = ? AND path = ?",
-                            [size, table["snapshot_id"], fqn, col])
+                table_id = con.execute("SELECT table_snapshot_id FROM tables WHERE snapshot_id=? AND fqn=?", [table["snapshot_id"], fqn]).fetchone()[0]
+                con.execute("DELETE FROM column_measurements WHERE table_snapshot_id=? AND path=?", [table_id, col])
+                if size is not None:
+                    con.execute("INSERT INTO column_measurements VALUES (?, ?, ?)", [table_id, col, size])
             con.execute("COMMIT")
         except BaseException:
             con.execute("ROLLBACK")

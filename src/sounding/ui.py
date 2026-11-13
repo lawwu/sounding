@@ -157,7 +157,10 @@ class Handler(BaseHTTPRequestHandler):
             from . import bq
             path = urlsplit(self.path).path
             if path == "/api/refresh":
-                return self._json(self.server.refresh.start(body.get("datasets"), body.get("projects")), 202)
+                options = {k: body[k] for k in ("inventory_only", "include_preview_rows", "include_datasets", "exclude_datasets", "include_hidden", "project_concurrency", "resume") if k in body}
+                return self._json(self.server.refresh.start(body.get("datasets"), body.get("projects"), **options), 202)
+            if path == "/api/load-metadata":
+                return self._json(bq.load_table_metadata(body.get("fqn", "")))
             if path == "/api/table-queries":
                 return self._json(bq.table_queries(body.get("table", ""), body.get("days", 30),
                     project=body.get("project") or None, scope=body.get("scope", "user"),

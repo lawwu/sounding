@@ -233,18 +233,67 @@ uv run sounding routines bignumber                             # search function
 uv run sounding routine bigquery-public-data.persistent_udfs.bignumber_add
 ```
 
+### Inventory, filters and resumable project imports
+
+For a smaller catalog, import inventory first and load full table metadata only when needed:
+
+```bash
+sounding harvest --project tenant-one --project tenant-two --inventory-only \
+  --exclude-dataset 'stage*' --exclude-dataset '*_scratch' --project-concurrency 2
+sounding load-metadata tenant-one.analytics.events
+# Continue the same import after interruption (repeat its targets and options):
+sounding harvest --project tenant-one --project tenant-two --inventory-only \
+  --exclude-dataset 'stage*' --exclude-dataset '*_scratch' --project-concurrency 2 --resume
+```
+
+Inventory stores table/view identity, type, size, row count and timestamps. It uses
+small `tables.get` responses because `tables.list` does not supply all storage statistics.
+It does not request or retain schemas or view SQL, and skips routines, models,
+row policies, recommendations and samples. Missing values remain unknown. The table
+page's **Load full table metadata** button (CLI `load-metadata`, MCP
+`load_table_metadata`, HTTP `POST /api/load-metadata`) explicitly fetches its schema,
+view SQL and row policies. Local searches never fetch missing schemas; column searches
+cannot match inventory-only entries. A later inventory refresh creates a new inventory
+snapshot; earlier full snapshots remain in history.
+
+`--include-dataset` and `--exclude-dataset` accept repeatable, case-sensitive glob
+patterns matched against either the dataset name or `project.dataset`. Exclusions win.
+Hidden datasets are excluded unless `--include-hidden` is supplied, including explicit
+selections. Receipts record the active filters and excluded datasets. Filters do not
+delete previously imported data. Full metadata remains the default; inventory mode
+cannot be combined with `--include-preview-rows`.
+
+Project imports and refreshes save their most recent checkpoint next to the catalog
+in `.refresh.json`. `--resume` requires the same targets, filters and import mode;
+completed dataset imports and completed project discovery are skipped. Failed,
+partial and interrupted datasets are retried, with up to three attempts for temporary
+service/quota errors. Resume continues that run's saved discovery; start a new run to
+discover datasets added since then. A crash between publishing a dataset and saving
+its checkpoint can cause that dataset to be imported again. New runs replace the last
+checkpoint, but do not remove catalog history.
+
+`--project-concurrency` accepts 1–4 (default 1). Each active project retains the existing
+limits of four concurrent datasets and sixteen table requests per dataset, so higher
+project concurrency increases total API load. The Refresh metadata page exposes these
+options and **Resume last import**; MCP `refresh_metadata` and HTTP `POST /api/refresh`
+accept `inventory_only`, `include_datasets`, `exclude_datasets`, `include_hidden`,
+`project_concurrency` and `resume`. Saved progress is available after a server restart.
+
+See [column storage benchmarks](docs/column-storage-validation.md) for measured savings
+and tradeoffs on a copied catalog.
+
 ### Catalog upgrades
 
-This version uses catalog schema 6. Schema 2, 3, 4 and 5 catalogs are upgraded in place
+This version uses catalog schema 7. Schema 2–6 catalogs are upgraded in place
 the first time any Sounding command opens them. Schema 3 adds richer metadata;
-schema 4 adds saved workload reports; schema 5 adds models, row policies, recommendation caches and optional samples. Schema 6 stores each distinct table schema once in `schemas`, referenced by `tables.schema_hash`, instead of repeating it in each table's resource JSON. Existing snapshots are preserved, and older
+schema 4 adds saved workload reports; schema 5 adds models, row policies, recommendation caches and optional samples. Schema 6 stores each distinct table schema once in `schemas`, referenced by `tables.schema_hash`, instead of repeating it in each table's resource JSON. Schema 7 shares flattened column definitions and assigns each table snapshot an integer ID. Sparse column-cost measurements use `(table_snapshot_id, path)` keys; shared definitions use `(column_schema_id, path)`, both enforced by primary keys. Existing snapshots are preserved, and older
 metadata fields stay unknown until the next harvest. Each migration runs in one
 transaction, so a failed step rolls back without changing its starting schema.
 
 Schema deduplication hashes exactly the schema value using SHA-256 over canonical
 JSON (sorted object keys and compact separators). Column/array order and every field
 attribute are preserved. The migration processes bounded batches in one transaction;
-no snapshots, flattened columns, cost estimates or preview rows are removed. Readers
+no snapshot history, column attributes, cost estimates or preview rows are lost. Repeated flattened definitions are stored once; the `columns` view reconstructs their historical associations. Readers
 reconstruct schemas transparently, so CLI, MCP and HTTP/UI output is unchanged.
 This reduces duplicate logical storage and prevents new copies on subsequent harvests.
 

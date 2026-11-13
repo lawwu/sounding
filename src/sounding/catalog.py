@@ -19,11 +19,12 @@ import duckdb
 import pyarrow as pa
 from filelock import FileLock, Timeout
 
+from . import column_storage
 from .errors import CatalogBusy, CatalogVersionError, MissingTable, integer, text
 
 CATALOG = Path(os.environ.get("SOUNDING_CATALOG", Path.home() / ".sounding" / "catalog.duckdb"))
 LOCK_TIMEOUT = 10
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 USD_PER_TIB = 6.25  # US on-demand list price; excludes discounts and the monthly free tier.
 TIB = 1024**4
 MIB = 1024**2
@@ -113,6 +114,8 @@ ALTER TABLE tables ADD COLUMN schema_hash VARCHAR;
 UPDATE catalog_meta SET version = 6;
 """,
 }
+MIGRATIONS[6] = "ALTER TABLE tables ADD COLUMN metadata_level VARCHAR; UPDATE catalog_meta SET version=7;"
+
 JSON_FIELDS = {"labels", "foreign_keys", "storage", "external", "materialized_view", "resource", "arguments",
                "row_access_policies", "feature_columns", "label_columns", "remote_info", "items", "preview_rows"}
 
@@ -140,7 +143,7 @@ TABLE_SCHEMA = pa.schema([
     ("row_access_policies_message", pa.string()),
     ("preview_rows", pa.string()), ("preview_status", pa.string()), ("preview_message", pa.string()),
     ("preview_sampled_at", _TS),
-    ("schema_hash", pa.string()),
+    ("schema_hash", pa.string()), ("metadata_level", pa.string()),
 ])
 COLUMN_SCHEMA = pa.schema([
     ("snapshot_id", pa.int64()), ("fqn", pa.string()), ("path", pa.string()),
@@ -212,6 +215,8 @@ def _migrate(path: Path, version: int) -> None:
                 con.execute(MIGRATIONS[version])
                 if version == 5:
                     _deduplicate_schemas(con)
+                if version == 6:
+                    column_storage.migrate(con)
                 con.execute("COMMIT")
             except BaseException:
                 con.execute("ROLLBACK")
@@ -312,6 +317,8 @@ def connect(path: Path | str | None = None, *, write: bool = False):
                     initial.execute(SCHEMA_V2)
                     for step in range(2, SCHEMA_VERSION):
                         initial.execute(MIGRATIONS[step])
+                        if step == 6:
+                            column_storage.migrate(initial)
             _VERIFIED.add(path)
             con = _open(path, write)
             try:
@@ -327,7 +334,7 @@ def save_snapshot(dataset: str, table_rows: list[dict], col_rows: list[dict],
                   dataset_row: dict | None = None, routine_rows: list[dict] = (),
                   model_rows: list[dict] = ()) -> int:
     """Publish one complete dataset atomically. Failed inserts leave the previous snapshot current."""
-    batches = [("tables", table_rows, TABLE_SCHEMA), ("columns", col_rows, COLUMN_SCHEMA),
+    batches = [("tables", table_rows, TABLE_SCHEMA),
                ("datasets", [dataset_row] if dataset_row else [], DATASET_SCHEMA),
                ("routines", list(routine_rows), ROUTINE_SCHEMA),
                ("models", list(model_rows), MODEL_SCHEMA)]
@@ -352,11 +359,44 @@ def save_snapshot(dataset: str, table_rows: list[dict], col_rows: list[dict],
                     # Explicit Arrow fields and BY NAME avoid depending on dict/DDL column ordering.
                     con.execute(f"INSERT INTO {name} BY NAME SELECT * FROM batch")
                     con.unregister("batch")
+            by_table = {}
+            for row in col_rows:
+                by_table.setdefault(row['fqn'], []).append(row)
+            identities = dict(con.execute('SELECT fqn,table_snapshot_id FROM tables WHERE snapshot_id=?', [sid]).fetchall())
+            if by_table.keys() - identities.keys():
+                raise ValueError("Column records must belong to a table in this snapshot.")
+            for fqn, rows in by_table.items():
+                column_storage.store(con, identities[fqn], rows)
             con.execute("COMMIT")
         except BaseException:
             con.execute("ROLLBACK")
             raise
     return sid
+
+
+def save_table_metadata(fqn, snapshot_id, row, columns):
+    from .errors import SoundingError
+    with connect(write=True) as con:
+        current = con.execute(LATEST + ' SELECT snapshot_id,table_snapshot_id FROM current_tables WHERE fqn=?', [fqn]).fetchone()
+        if not current or current[0] != snapshot_id:
+            raise SoundingError("The catalog changed while loading metadata. Retry against the new snapshot.")
+        table_id = current[1]
+        con.execute('BEGIN')
+        try:
+            row, canonical = _extract_schema(row)
+            if canonical is not None:
+                _store_schemas(con, {row['schema_hash']: canonical})
+            fields = [f for f in TABLE_SCHEMA if f.name in row and f.name not in ('snapshot_id', 'dataset', 'fqn', 'table_id')]
+            con.register('details_batch', pa.Table.from_pylist([_encode(row)], schema=pa.schema(fields)))
+            assignments = ', '.join(f'{f.name}=b.{f.name}' for f in fields)
+            con.execute(f'UPDATE tables SET {assignments},column_schema_id=NULL FROM details_batch b WHERE table_snapshot_id=?', [table_id])
+            con.unregister('details_batch')
+            con.execute('DELETE FROM column_measurements WHERE table_snapshot_id=?', [table_id])
+            column_storage.store(con, table_id, columns)
+            con.execute('COMMIT')
+        except BaseException:
+            con.execute('ROLLBACK')
+            raise
 
 
 def _encode(row: dict) -> dict:
@@ -538,6 +578,10 @@ def describe(con, fqn: str) -> dict:
     if row is None:
         raise MissingTable("Table is not in the latest catalog snapshot; harvest its dataset first.")
     out = {k: _decode(k, v) for k, v in zip([d[0] for d in cur.description], row)}
+    out.pop("table_snapshot_id", None)
+    out.pop("column_schema_id", None)
+    if out.get("metadata_level") is None:
+        out.pop("metadata_level", None)
     resource = out.pop("resource", None) or {}
     schema_hash = out.pop("schema_hash", None)
     if schema_hash is not None:
