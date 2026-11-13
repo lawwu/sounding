@@ -308,3 +308,47 @@ test('late model responses cannot replace a table', async () => {
   assert.match(h.element('#detail').innerHTML, /p\.d\.t/);
   assert.doesNotMatch(h.element('#detail').innerHTML, /Input features/);
 });
+
+test('inventory hydration is explicit and a late result cannot replace another table', async () => {
+  const h = harness(); await show(h, 'p.d.A');
+  h.context.inventory = {...table('p.d.A'), metadata_level:'inventory'};
+  h.run('renderTable(inventory)');
+  assert.match(h.element('#detail').innerHTML, /Inventory only/);
+  assert.doesNotMatch(h.element('#detail').innerHTML, /id="costs"/);
+  assert.equal(h.pending.filter(p => p.url === '/api/load-metadata').length, 0);
+  const loading = h.element('#load-metadata').onclick({target:h.element('#load-metadata')});
+  await show(h, 'p.d.B');
+  const html = h.element('#detail').innerHTML;
+  h.resolve('/api/load-metadata', {...table('p.d.A'), metadata_level:'full'}); await loading;
+  assert.equal(h.element('#detail').innerHTML, html);
+});
+
+test('refresh forwards inventory mode, filters, hidden selection and concurrency', async () => {
+  const h = harness(); await new Promise(resolve => setImmediate(resolve));
+  h.run('refreshPage()');
+  h.element('#refresh-projects').value = 'p, q';
+  h.element('#refresh-datasets').value = '';
+  h.element('#refresh-mode').value = 'inventory';
+  h.element('#refresh-include').value = '*prod*';
+  h.element('#refresh-exclude').value = 'stage*, *_scratch';
+  h.element('#refresh-hidden').checked = true;
+  h.element('#refresh-concurrency').value = '2';
+  const starting = h.run('startRefresh()');
+  const request = h.pending.find(p => p.url === '/api/refresh' && p.options.method === 'POST');
+  assert.deepEqual(JSON.parse(request.options.body), {projects:['p','q'], datasets:[], inventory_only:true,
+    include_datasets:['*prod*'], exclude_datasets:['stage*','*_scratch'], include_hidden:true, project_concurrency:2, resume:false});
+  h.resolve('/api/refresh', {status:'complete', datasets:[], projects:[]}); await starting;
+  h.resolve('/api/refresh', {status:'idle'});
+});
+
+test('resume uses the saved import scope rather than current selections', async () => {
+  const h = harness(); await new Promise(resolve => setImmediate(resolve));
+  h.run('refreshState = {id:"saved",status:"interrupted",requested_projects:["p"],requested_datasets:[],inventory_only:true,filters:{exclude_datasets:["stage*"]},project_concurrency:2}; refreshPage()');
+  const starting = h.element('#resume-import').onclick();
+  const request = h.pending.find(p => p.url === '/api/refresh' && p.options.method === 'POST');
+  const body = JSON.parse(request.options.body);
+  assert.equal(body.resume, true); assert.deepEqual(body.projects, ['p']);
+  assert.equal(body.inventory_only, true); assert.deepEqual(body.exclude_datasets, ['stage*']);
+  h.resolve('/api/refresh', {status:'complete',datasets:[],projects:[]}); await starting;
+  h.resolve('/api/refresh', {status:'idle'});
+});

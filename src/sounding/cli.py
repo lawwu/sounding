@@ -60,8 +60,15 @@ def _main() -> None:
         command.add_argument("--projects-file", action="append", default=[], help="project IDs from a text list or JSON array; repeatable")
         command.add_argument("--datasets-file", action="append", default=[], help="dataset names from a text list or JSON array; repeatable")
         command.add_argument("--project", action="append", default=[], help="discover and import a whole project; repeat for multiple projects")
+        command.add_argument("--inventory-only", action="store_true", help="save names, types, sizes and timestamps; load schemas explicitly later")
+        command.add_argument("--include-dataset", action="append", default=[], help="include dataset-name or project.dataset glob; repeatable")
+        command.add_argument("--exclude-dataset", action="append", default=[], help="exclude dataset-name or project.dataset glob; repeatable")
+        command.add_argument("--include-hidden", action="store_true", help="include hidden datasets in discovery and selection")
+        command.add_argument("--project-concurrency", type=int, default=1, choices=range(1, 5), help="projects to import concurrently (1–4)")
+        command.add_argument("--resume", action="store_true", help="resume the last saved refresh with the same targets, filters and mode")
         command.add_argument("--include-preview-rows", action="store_true",
                              help="save up to 10 rows / 256 KB per table; WARNING: can add a material delay and stores actual data locally")
+    sub.add_parser("load-metadata", help="fetch and save one table schema and view SQL using free APIs").add_argument("table")
     sub.add_parser("browse", help="local project and dataset hierarchy")
     show = sub.add_parser("show", help="list or search catalog tables")
     show.add_argument("q", nargs="?", default="")
@@ -130,15 +137,19 @@ def _main() -> None:
     if getattr(a, "include_preview_rows", False):
         print("Warning: including preview rows can add a material delay (one extra data-read request per native table). "
               "Up to 10 rows / 256 KB per table will be stored locally. Metadata is saved before row downloads finish.", file=sys.stderr)
-    if a.cmd == "harvest" and not a.project:
+    if a.cmd == "harvest" and not a.project and not (a.inventory_only or a.include_dataset or a.exclude_dataset or a.include_hidden or a.resume or a.project_concurrency != 1):
         kwargs = {"include_preview_rows": True} if a.include_preview_rows else {}
         print(_receipt_line(bq.harvest(a.datasets, for_terminal("harvesting"), **kwargs)), file=sys.stderr)
     elif a.cmd in ("refresh", "harvest"):
         from .refresh import Job
-        result = Job(a.datasets, a.project, for_terminal("refreshing"), include_preview_rows=a.include_preview_rows).run()
+        result = Job(a.datasets, a.project, for_terminal("refreshing"), include_preview_rows=a.include_preview_rows,
+                     inventory_only=a.inventory_only, include_datasets=a.include_dataset, exclude_datasets=a.exclude_dataset,
+                     include_hidden=a.include_hidden, project_concurrency=a.project_concurrency, resume=a.resume).run()
         print(json.dumps(result, indent=2))
         if result["status"] in ("partial", "failed"):
             raise SystemExit(2)
+    elif a.cmd == "load-metadata":
+        print(json.dumps(bq.load_table_metadata(a.table), indent=2))
     elif a.cmd == "browse":
         with catalog.connect() as con:
             print(json.dumps(catalog.browse(con), indent=2))

@@ -85,10 +85,11 @@ function updateRefreshProgress() {
   $("#refresh-banner").innerHTML = progressHtml(refreshState) + '<button data-page="refresh">View refresh</button>';
   if (appPage !== "refresh" || !$("#refresh-progress")) return;
   $("#start-refresh").disabled = isRefreshing();
+  if ($("#resume-import")) $("#resume-import").disabled = isRefreshing();
   const rows = [...(refreshState.projects || []).map(r => ({...r, target:r.project, progress:`${r.datasets} datasets discovered`})),
     ...(refreshState.datasets || []).map(r => ({...r, target:r.dataset, progress:`${r.done} / ${r.total} items`}))];
   $("#refresh-progress").innerHTML = refreshState.status === "idle" ? '<p class="hint">Choose a scope and start a refresh. Progress will remain visible while you browse other tabs.</p>' :
-    `<div class="refresh-box">${progressHtml(refreshState)}${(refreshState.warnings || []).map(w => `<p class="hint">${esc(w)}</p>`).join("")}</div>
+    `<div class="refresh-box">${progressHtml(refreshState)}<p class="hint">Mode: ${refreshState.inventory_only ? "inventory" : "full metadata"} · Include: ${esc((refreshState.filters?.include_datasets || []).join(", ") || "all datasets")} · Exclude: ${esc((refreshState.filters?.exclude_datasets || []).join(", ") || "none")} · Hidden datasets: ${refreshState.filters?.include_hidden ? "included" : "excluded"} · ${num((refreshState.excluded_datasets || []).length)} datasets excluded</p>${(refreshState.warnings || []).map(w => `<p class="hint">${esc(w)}</p>`).join("")}</div>
      <div class="scroll"><table><thead><tr><th>Project / dataset</th><th>Status</th><th>Progress</th></tr></thead><tbody>${rows.map(r => `<tr><td>${esc(r.target)}${r.message ? `<div class="err">${esc(r.message)}</div>` : ""}</td><td class="status-${esc(r.status)}">${esc(r.status)}</td><td>${esc(r.progress)}</td></tr>`).join("")}</tbody></table></div>`;
 }
 
@@ -103,8 +104,25 @@ function refreshPage(project, dataset) {
     <div class="selection-list">${hierarchy.map(p => `<div><label><input type="checkbox" data-select-project="${esc(p.project)}" ${selectedProjects.has(p.project) ? "checked" : ""}><span><b>${esc(p.project)}</b><br><small>Entire project · discover all accessible datasets</small></span></label>
       <details><summary class="hint">Choose from ${num(p.datasets.length)} saved datasets</summary>${p.datasets.map(d => `<label><input type="checkbox" data-select-dataset="${esc(d.dataset)}" ${selectedDatasets.has(d.dataset) ? "checked" : ""}><span>${esc(d.dataset_id)} <small>· ${num(d.tables)} tables</small></span></label>`).join("")}</details></div>`).join("")}</div>
     <div class="toolbar"><label>Other project IDs<input id="refresh-projects" placeholder="project-one, project-two"></label><label>Other datasets<input id="refresh-datasets" placeholder="project.dataset, project.other"></label><button id="start-refresh" class="primary">Start refresh</button></div>
+    <div class="toolbar"><label>Import mode<select id="refresh-mode"><option value="full">Full metadata</option><option value="inventory">Inventory only · smaller catalog</option></select></label>
+      <label>Include datasets<input id="refresh-include" placeholder="*prod*, project.dataset"></label>
+      <label>Exclude datasets<input id="refresh-exclude" placeholder="stage*, *_scratch"></label>
+      <label>Concurrent projects<input id="refresh-concurrency" type="number" min="1" max="4" value="1"></label></div>
+    <p><label><input id="refresh-hidden" type="checkbox"> Include hidden datasets</label> ${refreshState.id ? '<button id="resume-import">Resume last import</button>' : ""}</p>
+    <p class="hint">Patterns match dataset names or project.dataset. Exclusions win. Inventory omits schemas and view SQL until you load them on a table. Resume uses the same targets, filters and mode; completed datasets are skipped.</p>
     <div id="refresh-error" class="err" role="status"></div><div id="refresh-progress"></div>`;
   $("#start-refresh").onclick = startRefresh;
+  if ($("#resume-import")) $("#resume-import").onclick = async () => {
+    $("#resume-import").disabled = true;
+    ++refreshGeneration;
+    const my = viewSeq;
+    try {
+      refreshState = await api("/api/refresh", {projects:refreshState.requested_projects, datasets:refreshState.requested_datasets,
+        inventory_only:!!refreshState.inventory_only, include_preview_rows:!!refreshState.include_preview_rows, ...(refreshState.filters || {}),
+        project_concurrency:refreshState.project_concurrency || 1, resume:true});
+      updateRefreshProgress(); pollRefresh();
+    } catch (err) { if (my === viewSeq) { $("#refresh-error").textContent = err.message; $("#resume-import").disabled = false; } }
+  };
   updateRefreshProgress();
 }
 
@@ -125,7 +143,10 @@ async function startRefresh() {
   ++refreshGeneration;
   const my = viewSeq;
   try {
-    refreshState = await api("/api/refresh", {projects, datasets});
+    refreshState = await api("/api/refresh", {projects, datasets,
+      inventory_only: $("#refresh-mode").value === "inventory", include_datasets: split($("#refresh-include").value),
+      exclude_datasets: split($("#refresh-exclude").value), include_hidden: $("#refresh-hidden").checked,
+      project_concurrency: Number($("#refresh-concurrency").value), resume: false});
     updateRefreshProgress(); pollRefresh();
   } catch (err) { if (my === viewSeq) { $("#refresh-error").textContent = err.message; $("#start-refresh").disabled = false; } }
 }
@@ -297,7 +318,7 @@ function metadataStatus(status, message) {
   const fallback = {denied:"Access denied; the contents are unknown.", partial:"Some details could not be read.",
     unavailable:"Metadata was unavailable during refresh.", quota:"The read quota was reached.",
     disabled:"The API is not enabled.", not_applicable:"Not supported for this table type.", pending:"Sample is loading in the background. Reload the catalog to see the latest saved rows.",
-    not_requested:"Row samples are not included by default. Load a sample here, or import with --include-preview-rows (can add a material delay)."};
+    not_requested:"This metadata was not requested. Run a full metadata refresh to collect it."};
   return `<p class="notes">${esc(message || fallback[status] || "Not collected yet. Refresh this dataset to collect it.")}</p>`;
 }
 
@@ -314,7 +335,7 @@ function recommendationsSection(result) {
 
 function policiesSection(t) {
   const policies = t.row_access_policies || [];
-  return `<h3>Row-access policies</h3>${metadataStatus(t.row_access_policies_status, t.row_access_policies_message)}
+  return `<h3>Row-access policies</h3>${metadataStatus(t.row_access_policies_status, t.row_access_policies_message || (t.metadata_level === "inventory" ? "Row-access policies were not requested in inventory mode. Load full table metadata to collect them." : null))}
     ${t.row_access_policies_status === "harvested" && !policies.length ? '<p class="hint">No row-access policies found at refresh time.</p>' : ""}
     ${policies.map(p => `<details><summary>${esc(p.rowAccessPolicyReference?.policyId || "Row policy")}</summary><p class="hint">Modified ${esc(p.lastModifiedTime || "unknown")}</p><pre>${esc(p.filterPredicate || "Filter unavailable")}</pre></details>`).join("")}`;
 }
@@ -322,7 +343,7 @@ function policiesSection(t) {
 function sampleSection(t) {
   const rows = t.preview_rows || [], keys = Object.keys(rows[0] || {});
   const cell = v => esc(typeof v === "object" && v !== null ? JSON.stringify(v) : v);
-  return `${metadataStatus(t.preview_status || "not_requested", t.preview_message)}${t.preview_sampled_at ? `<p class="hint">Saved ${esc(t.preview_sampled_at)} · ${rows.length} rows · arbitrary order, not a random sample.</p>` : ""}
+  return `${metadataStatus(t.preview_status || "not_requested", t.preview_message || ((!t.preview_status || t.preview_status === "not_requested") ? "Row samples are not included by default. Load a sample here, or import with --include-preview-rows (can add a material delay)." : null))}${t.preview_sampled_at ? `<p class="hint">Saved ${esc(t.preview_sampled_at)} · ${rows.length} rows · arbitrary order, not a random sample.</p>` : ""}
     ${t.preview_status === "harvested" && t.preview_message ? `<p class="hint">${esc(t.preview_message)}</p>` : ""}
     ${rows.length ? `<div class="scroll"><table><thead><tr>${keys.map(k => `<th>${esc(k)}</th>`).join("")}</tr></thead><tbody>${rows.map(r => `<tr>${keys.map(k => `<td title="${cell(r[k])}">${cell(r[k])}</td>`).join("")}</tr>`).join("")}</tbody></table></div>` : t.preview_status === "harvested" ? `<p class="hint">${t.preview_message ? "No rows fit within the saved sample limit." : "No rows returned."}</p>` : ""}`;
 }
@@ -417,12 +438,13 @@ function renderTable(t) {
     ${labelChips(t.labels)}
     ${t.description ? `<p class="desc">${esc(t.description)}</p>` : ""}
     ${(t.notes || []).length ? `<ul class="notes">${t.notes.map(n => `<li>${esc(n)}</li>`).join("")}</ul>` : ""}
+    ${t.metadata_level === "inventory" ? '<p class="notes">Inventory only: schemas and view SQL have not been loaded. Column searches do not cover this table.</p><button id="load-metadata">Load full table metadata · free</button><span id="metadata-error" class="err"></span>' : ""}
     ${detailsSection(t)}
     ${t.partition?.ingestion_time ? '<p class="notes">Ingestion-time partitioning uses the virtual _PARTITIONTIME column (and _PARTITIONDATE for daily partitions). It is not a stored schema column.</p>' : ""}
     ${t.partition?.range ? `<p class="hint">Partition range: ${esc(t.partition.range.start)} to ${esc(t.partition.range.end)} (exclusive), interval ${esc(t.partition.range.interval)}.</p>` : ""}
 
-    <h3>Schema <span class="hint">${t.columns.length} column paths</span>
-      ${t.type === "TABLE" ? `<button id="costs">${hasCosts ? "Refresh" : "Compute"} column costs</button><span class="hint">one free dry run per top-level column</span>` : ""}</h3>
+    <h3>Schema <span class="hint">${t.metadata_level === "inventory" ? "not loaded" : `${t.columns.length} column paths`}</span>
+      ${t.type === "TABLE" && t.metadata_level !== "inventory" ? `<button id="costs">${hasCosts ? "Refresh" : "Compute"} column costs</button><span class="hint">one free dry run per top-level column</span>` : ""}</h3>
     ${(t.cost_warnings || []).map(w => `<p class="hint">${esc(w)}</p>`).join("")}
     ${receiptHtml(t.receipt)}
     <table><thead><tr><th>Column</th><th>Type</th><th>Mode</th><th>Scan cost</th>${hasDesc ? "<th>Description</th>" : ""}${hasMetadata ? "<th>Field metadata</th>" : ""}</tr></thead><tbody>
@@ -451,6 +473,11 @@ function renderTable(t) {
     <div><button id="est">Estimate</button></div>
     <div id="estout" class="est"></div>`;
 
+  if ($("#load-metadata")) $("#load-metadata").onclick = async e => {
+    e.target.disabled = true;
+    try { const updated = await api("/api/load-metadata", {fqn:t.fqn}); if (active()) renderTable(updated); }
+    catch (err) { if (active()) { $("#metadata-error").textContent = err.message; e.target.disabled = false; } }
+  };
   $("#est").onclick = estimate;
   let querySeq = 0;
   const invalidateQueries = () => { ++querySeq; $("#queries-out").textContent = ""; $("#load-queries").disabled = false; };

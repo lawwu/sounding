@@ -38,17 +38,21 @@ def create_server() -> MCPServer:
             return catalog.browse(con)
 
     @app.tool(description="Start a background metadata refresh for explicit project.dataset names and/or whole projects. "
-              "Projects discover all accessible non-hidden datasets, including newly added datasets. Free metadata APIs only, "
+              "Projects discover accessible datasets; hidden datasets require include_hidden. Inventory mode omits schemas and view SQL. Include/exclude patterns filter dataset names; resume continues the last checkpoint. Free metadata APIs only, "
               "no SQL; uses existing Google credentials. Poll refresh_status on this MCP server for progress and per-dataset "
               "results. Failed datasets retain their previous snapshots. Only one refresh per catalog can run at a time.")
     @tool_errors
     def refresh_metadata(datasets: Annotated[list[str] | None, Field(max_length=1000)] = None,
-                         projects: Annotated[list[str] | None, Field(max_length=25)] = None) -> dict:
-        return refresh_manager.start(datasets, projects)
+                         projects: Annotated[list[str] | None, Field(max_length=25)] = None,
+                         inventory_only: bool = False, include_datasets: list[str] | None = None,
+                         exclude_datasets: list[str] | None = None, include_hidden: bool = False,
+                         project_concurrency: Annotated[int, Field(ge=1, le=4)] = 1, resume: bool = False) -> dict:
+        return refresh_manager.start(datasets, projects, inventory_only=inventory_only,
+                                     include_datasets=include_datasets, exclude_datasets=exclude_datasets,
+                                     include_hidden=include_hidden, project_concurrency=project_concurrency, resume=resume)
 
     @app.tool(description="Poll the current or last metadata refresh started by this MCP server. Local only. "
-              "Returns status, progress, per-project discovery results and per-dataset outcomes. A restart clears this "
-              "in-memory status, but published catalog snapshots are retained.")
+              "Returns status, progress, per-project discovery results and per-dataset outcomes. Saved checkpoints survive restarts; interrupted runs can be resumed.")
     @tool_errors
     def refresh_status() -> dict:
         return refresh_manager.snapshot()
@@ -76,6 +80,11 @@ def create_server() -> MCPServer:
     def describe_table(table: Annotated[str, Field(min_length=1, max_length=2048)]) -> dict:
         with catalog.connect() as con:
             return catalog.describe(con, table)
+
+    @app.tool(description="Explicitly load and save a table's full schema and view SQL after an inventory import. Free tables.get and row-policy APIs only; no SQL or row reads.")
+    @tool_errors
+    def load_table_metadata(table: Annotated[str, Field(min_length=1, max_length=2048)]) -> dict:
+        return bq.load_table_metadata(table)
 
     @app.tool(description="Dataset location, description, labels, default expirations and storage "
               "billing model, with its tables count and routine signatures (no bodies). Local only; "

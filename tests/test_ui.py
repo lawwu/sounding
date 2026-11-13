@@ -175,3 +175,15 @@ def test_refresh_and_history_endpoints_and_local_docs(server, monkeypatch):
     assert inspect.call_args.kwargs['include_sql'] is False
     docs = json.loads(request(server, '/api/docs')[2])['html']
     assert 'MCP' in docs and 'CLI' in docs and '/api/refresh' in docs
+
+
+def test_inventory_refresh_and_hydration_routes(server, monkeypatch):
+    from sounding import refresh
+    seen=[]
+    monkeypatch.setattr(refresh.Manager,'start',lambda self,datasets,projects,**opts: seen.append(opts) or {'status':'running'})
+    options={'projects':['p'],'inventory_only':True,'exclude_datasets':['stage*'],'include_hidden':True,'project_concurrency':2,'resume':True}
+    status,_,body=request(server,'/api/refresh','POST',json.dumps(options))
+    assert status == 202 and seen[0]['inventory_only'] and seen[0]['resume']
+    monkeypatch.setattr(bq,'load_table_metadata',lambda fqn: {'fqn':fqn,'metadata_level':'full'})
+    status,_,body=request(server,'/api/load-metadata','POST',json.dumps({'fqn':'p.d.t'}))
+    assert status == 200 and json.loads(body)['metadata_level'] == 'full'

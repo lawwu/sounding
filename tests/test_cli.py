@@ -144,3 +144,16 @@ def test_bad_import_file_stops_before_network(tmp_path, monkeypatch, capsys):
     path.write_text('[12]')
     code, output = run(monkeypatch, capsys, "refresh", "--projects-file", str(path))
     assert code == 2 and "array of names" in output.err
+
+
+def test_inventory_filters_and_resume_cli(monkeypatch, capsys):
+    from sounding import refresh
+    seen=[]
+    monkeypatch.setattr(refresh.Job, 'run', lambda self: seen.append(self) or {'status':'complete'})
+    code, output = run(monkeypatch,capsys,'harvest','--project','p','--inventory-only',
+                       '--include-dataset','prod*','--exclude-dataset','*_scratch','--include-hidden',
+                       '--project-concurrency','2','--resume')
+    assert code == 0
+    job=seen[0]
+    assert job.inventory_only and job.resume and job.project_concurrency == 2
+    assert job.filters == {'include_datasets':['prod*'],'exclude_datasets':['*_scratch'],'include_hidden':True}

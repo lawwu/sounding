@@ -53,7 +53,7 @@ def v5_catalog(path):
             for name, fields in [('a',[field('a', maxLength='42')]), ('b',[field('a', maxLength='42')]), ('different',[field('a', maxLength='43')])]:
                 row, columns = bq.table_record(remote_table(name, fields).to_api_repr(), 'p.d')
                 row.update(snapshot_id=sid, preview_rows=[{'a':'keep me'}], preview_status='harvested')
-                con.register('batch',pa.Table.from_pylist([catalog._encode(row)], schema=catalog.TABLE_SCHEMA.remove(catalog.TABLE_SCHEMA.get_field_index('schema_hash'))))
+                con.register('batch',pa.Table.from_pylist([catalog._encode(row)], schema=pa.schema([f for f in catalog.TABLE_SCHEMA if f.name not in ('schema_hash', 'metadata_level')])))
                 con.execute('INSERT INTO tables BY NAME SELECT * FROM batch')
                 con.register('batch',pa.Table.from_pylist([dict(c,snapshot_id=sid) for c in columns],schema=catalog.COLUMN_SCHEMA))
                 con.execute('INSERT INTO columns BY NAME SELECT * FROM batch')
@@ -90,6 +90,8 @@ def test_v5_migration_lossless_batched_and_repeatable(tmp_path, monkeypatch, cap
         names = [d[0] for d in cur.description]
         restored = [dict(zip(names, row)) for row in cur.fetchall()]
         for row in restored:
+            for key in ('table_snapshot_id', 'column_schema_id', 'metadata_level'):
+                row.pop(key, None)
             schema_hash = row.pop('schema_hash')
             if schema_hash:
                 resource = json.loads(row['resource'])
