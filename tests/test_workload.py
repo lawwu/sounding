@@ -182,7 +182,7 @@ def test_v3_upgrade_preserves_metadata_and_report_reads(tmp_path):
         con.execute("INSERT INTO snapshots VALUES (1, '2026-01-01', 'p.d')")
     with catalog.connect(path) as con:
         assert con.execute("SELECT count(*) FROM snapshots").fetchone()[0] == 1
-        assert con.execute("SELECT version FROM catalog_meta").fetchone()[0] == 4
+        assert con.execute("SELECT version FROM catalog_meta").fetchone()[0] == catalog.SCHEMA_VERSION
         with pytest.raises(SoundingError, match="No saved"):
             catalog.workload_report(con)
 

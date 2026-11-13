@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import files
 from urllib.parse import parse_qs, urlsplit
 
-from . import catalog
+from . import catalog, refresh
 from .errors import SoundingError, integer, public_error
 
 MAX_BODY = 400_000  # at most 100k Unicode SQL characters plus JSON overhead
@@ -26,6 +26,7 @@ class Server(ThreadingHTTPServer):
 
     def __init__(self, address, handler=None):
         self.api_token = secrets.token_urlsafe(32)
+        self.refresh = refresh.Manager()
         super().__init__(address, handler or Handler)
 
 
@@ -95,13 +96,34 @@ class Handler(BaseHTTPRequestHandler):
                 with catalog.connect() as con:
                     result = catalog.stats(con)
                 return self._json(result)
+            if u.path == "/api/docs":
+                return self._json({"html": files("sounding").joinpath("docs.html").read_text()})
+            if u.path == "/api/browse":
+                with catalog.connect() as con:
+                    result = catalog.browse(con)
+                return self._json(result)
+            if u.path == "/api/refresh":
+                return self._json(self.server.refresh.snapshot())
+            if u.path == "/api/dataset":
+                with catalog.connect() as con:
+                    result = catalog.describe_dataset(con, q.get("dataset", ""))
+                return self._json(result)
+            if u.path == "/api/model":
+                with catalog.connect() as con:
+                    result = catalog.describe_model(con, q.get("fqn", ""))
+                return self._json(result)
+            if u.path == "/api/recommendations":
+                with catalog.connect() as con:
+                    result = catalog.recommendations(con, q.get("project", ""))
+                return self._json(result)
             if u.path == "/api/search":
                 try:
                     offset = int(q.get("offset", "0"))
                 except ValueError as error:
                     raise SoundingError("offset must be an integer.") from error
                 with catalog.connect() as con:
-                    result = catalog.search(con, q.get("q", ""), limit=catalog.SEARCH_LIMIT, offset=offset)
+                    result = catalog.search(con, q.get("q", ""), limit=catalog.SEARCH_LIMIT, offset=offset,
+                                            project=q.get("project", ""), dataset=q.get("dataset", ""))
                 return self._json(result)
             if u.path == "/api/table":
                 with catalog.connect() as con:
@@ -134,10 +156,21 @@ class Handler(BaseHTTPRequestHandler):
                 raise SoundingError("Request body must be a JSON object.")
             from . import bq
             path = urlsplit(self.path).path
+            if path == "/api/refresh":
+                return self._json(self.server.refresh.start(body.get("datasets"), body.get("projects")), 202)
+            if path == "/api/table-queries":
+                return self._json(bq.table_queries(body.get("table", ""), body.get("days", 30),
+                    project=body.get("project") or None, scope=body.get("scope", "user"),
+                    rank_by=body.get("rank_by", "billed_bytes"), limit=body.get("limit", 20)))
+            if path == "/api/inspect-job":
+                return self._json(bq.inspect_query_job(body.get("job_id", ""), body.get("location", ""),
+                    project=body.get("project"), include_sql=body.get("include_sql", False)))
             if path == "/api/estimate":
                 return self._json(bq.dry_run(body.get("sql", "")))
             if path == "/api/preview":
                 return self._json(bq.preview(body.get("fqn", ""), 10))
+            if path == "/api/refresh-sample":
+                return self._json(bq.refresh_sample(body.get("fqn", "")))
             if path == "/api/column-costs":
                 fqn = body.get("fqn", "")
                 costs = bq.column_costs(fqn)

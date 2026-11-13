@@ -10,7 +10,7 @@ from mcp.server.mcpserver import MCPServer
 from mcp.server.mcpserver.exceptions import ToolError
 from pydantic import Field
 
-from . import bq, catalog, workload
+from . import bq, catalog, workload, refresh
 from .errors import public_error
 
 
@@ -29,6 +29,29 @@ def tool_errors(fn):
 
 def create_server() -> MCPServer:
     app = MCPServer("sounding")
+    refresh_manager = refresh.Manager()
+
+    @app.tool(description="Saved project → dataset hierarchy with table counts and harvest timestamps. Local only; no Google calls.")
+    @tool_errors
+    def browse_catalog() -> dict:
+        with catalog.connect() as con:
+            return catalog.browse(con)
+
+    @app.tool(description="Start a background metadata refresh for explicit project.dataset names and/or whole projects. "
+              "Projects discover all accessible non-hidden datasets, including newly added datasets. Free metadata APIs only, "
+              "no SQL; uses existing Google credentials. Poll refresh_status on this MCP server for progress and per-dataset "
+              "results. Failed datasets retain their previous snapshots. Only one refresh per catalog can run at a time.")
+    @tool_errors
+    def refresh_metadata(datasets: Annotated[list[str] | None, Field(max_length=1000)] = None,
+                         projects: Annotated[list[str] | None, Field(max_length=25)] = None) -> dict:
+        return refresh_manager.start(datasets, projects)
+
+    @app.tool(description="Poll the current or last metadata refresh started by this MCP server. Local only. "
+              "Returns status, progress, per-project discovery results and per-dataset outcomes. A restart clears this "
+              "in-memory status, but published catalog snapshots are retained.")
+    @tool_errors
+    def refresh_status() -> dict:
+        return refresh_manager.snapshot()
 
     @app.tool(description="Literal substring search of harvested tables, columns and descriptions. "
               "Local only; never calls BigQuery. Returns items and next_offset; pass next_offset as "
@@ -37,9 +60,11 @@ def create_server() -> MCPServer:
     @tool_errors
     def search_catalog(q: Annotated[str, Field(max_length=2048)] = "",
                        limit: Annotated[int, Field(ge=1, le=100)] = 50,
-                       offset: Annotated[int, Field(ge=0, le=1_000_000)] = 0) -> dict:
+                       offset: Annotated[int, Field(ge=0, le=1_000_000)] = 0,
+                       project: Annotated[str, Field(max_length=2048)] = "",
+                       dataset: Annotated[str, Field(max_length=2048)] = "") -> dict:
         with catalog.connect() as con:
-            return catalog.search(con, q, limit, offset)
+            return catalog.search(con, q, limit, offset, project=project, dataset=dataset)
 
     @app.tool(description="Schema, size, UTC freshness, partitioning and clustering for "
               "project.dataset.table in the latest snapshot, plus declared (unenforced) keys, "
@@ -59,6 +84,18 @@ def create_server() -> MCPServer:
     def describe_dataset(dataset: Annotated[str, Field(min_length=1, max_length=2048)]) -> dict:
         with catalog.connect() as con:
             return catalog.describe_dataset(con, dataset)
+
+    @app.tool(description="Saved BigQuery model metadata: type, features, labels, location and remote model settings. Local only; no training or inference.")
+    @tool_errors
+    def describe_model(model: Annotated[str, Field(min_length=1, max_length=2048)]) -> dict:
+        with catalog.connect() as con:
+            return catalog.describe_model(con, model)
+
+    @app.tool(description="Read cached partition/cluster recommendations and table insights for a project. Includes coverage and timestamps; may be unavailable or stale. Local only; never applies suggestions.")
+    @tool_errors
+    def project_recommendations(project: Annotated[str, Field(min_length=1, max_length=2048)]) -> dict:
+        with catalog.connect() as con:
+            return catalog.recommendations(con, project)
 
     @app.tool(description="Literal substring search of harvested functions and procedures by name, "
               "description or body. Local only; never calls BigQuery. Bodies are 1000-character "
@@ -102,6 +139,20 @@ def create_server() -> MCPServer:
     @tool_errors
     def cost_report(hours: Annotated[int, Field(ge=1, le=bq.COST_REPORT_MAX_HOURS)] = 24) -> dict:
         return bq.cost_report(hours)
+
+    @app.tool(description="Top individual completed query jobs referencing a table, default last 30 days, using free jobs.list. "
+              "Searches the configured job project unless project is supplied. User scope is the current identity; project "
+              "scope needs permission to see other users' job metadata. Scans at most the newest 1000 top-level jobs. "
+              "Inspect warnings/truncated/missing_references; script children and other projects are excluded. "
+              "Metrics are whole-job totals, not cost allocated to the table. No SQL text is returned or stored.")
+    @tool_errors
+    def table_query_history(table: Annotated[str, Field(min_length=1, max_length=2048)],
+                            days: Annotated[int, Field(ge=1, le=180)] = 30,
+                            project: Annotated[str | None, Field(max_length=256)] = None,
+                            scope: Annotated[str, Field(pattern="^(user|project)$")] = "user",
+                            rank_by: Annotated[str, Field(pattern="^(billed_bytes|slot_ms)$")] = "billed_bytes",
+                            limit: Annotated[int, Field(ge=1, le=100)] = 20) -> dict:
+        return bq.table_queries(table, days, project=project, scope=scope, rank_by=rank_by, limit=limit)
 
     @app.tool(description="Find recurring costly queries using fixed regional INFORMATION_SCHEMA SQL. "
               "Default is a FREE dry-run preview. Set allow_billed=true only when the user has authorized "

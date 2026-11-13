@@ -80,3 +80,28 @@ def test_query_report_cli_is_local(monkeypatch, capsys):
     saved = catalog.save_workload_report({"status": "complete", "project": "p"})
     code, out = run(monkeypatch, capsys, "query-report", saved["report_id"])
     assert code == 0 and json.loads(out.out) == saved
+
+
+def test_refresh_cli_partial_results_and_table_history(monkeypatch, capsys):
+    from google.api_core.exceptions import Forbidden
+    monkeypatch.setattr(bq, 'project_datasets', lambda p: {'datasets':[p+'.d'], 'unreachable':[], 'receipt':{}})
+    monkeypatch.setattr(bq, 'harvest', lambda *args: (_ for _ in ()).throw(Forbidden('denied')))
+    code, output = run(monkeypatch, capsys, 'refresh', '--project', 'p')
+    assert code == 2
+    assert json.loads(output.out)['datasets'][0]['status'] == 'failed'
+    seen = []
+    monkeypatch.setattr(bq, 'table_queries', lambda table,days,**kwargs: seen.append((table,days,kwargs)) or {'jobs':[]})
+    code, output = run(monkeypatch, capsys, 'table-queries', 'p.d.t', '--scope', 'project')
+    assert code == 0 and seen[0][1] == 30 and seen[0][2]['scope'] == 'project'
+
+
+@pytest.mark.parametrize("command", ["harvest", "refresh"])
+@pytest.mark.parametrize("include", [False, True])
+def test_preview_rows_flag_is_explicit_and_warns(monkeypatch, capsys, command, include):
+    seen = []
+    monkeypatch.setattr(bq, "harvest", lambda datasets, progress, **kwargs: seen.append(kwargs) or bq.free_api_receipt("tables.get"))
+    args = [command, "p.d"] + (["--include-preview-rows"] if include else [])
+    code, output = run(monkeypatch, capsys, *args)
+    assert code == 0
+    assert seen == ([{"include_preview_rows": True}] if include else [{}])
+    assert ("material delay" in output.err) is include

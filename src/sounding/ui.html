@@ -20,6 +20,7 @@
     }
   }
   * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
   html, body { margin: 0; height: 100%; }
   body { background: var(--bg); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, sans-serif;
          display: flex; flex-direction: column; }
@@ -31,7 +32,56 @@
   #q { flex: 1 1 320px; max-width: 560px; padding: 8px 12px; font-size: 15px; border: 1px solid var(--line);
        border-radius: 8px; background: var(--bg); color: var(--ink); outline: none; }
   #q:focus { border-color: var(--accent); }
-  main { flex: 1; display: grid; grid-template-columns: minmax(300px, 420px) 1fr; min-height: 0; }
+  main { flex: 1; display: grid; grid-template-columns: 240px minmax(260px, 350px) minmax(0, 1fr); min-height: 0; }
+  #browser { overflow-y: auto; border-right: 1px solid var(--line); background: var(--panel); padding: 16px 10px; }
+  #app-menu { display: grid; gap: 4px; padding-bottom: 16px; margin-bottom: 16px; border-bottom: 1px solid var(--line); }
+  .menu-item { text-align: left; border: 0; padding: 9px 12px; font-size: 13px; background: transparent; }
+  .menu-item.active { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+  main.workspace { grid-template-columns: 240px minmax(0, 1fr); }
+  #detail { min-width: 0; }
+  .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; margin: 18px 0; }
+  .toolbar label { display: grid; gap: 4px; color: var(--muted); font-size: 12px; }
+  .toolbar input, .toolbar select, .target-input { padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--ink); font: inherit; }
+  .toolbar input[type=number] { width: 80px; }
+  .project-entry { display: grid; gap: 8px; padding-bottom: 16px; margin-bottom: 12px; border-bottom: 1px solid var(--line); }
+  .project-entry label { font-size: 12px; font-weight: 600; }
+  .project-entry input { width: 100%; min-width: 0; box-sizing: border-box; padding: 8px; border: 1px solid var(--line); border-radius: 6px; background: var(--panel); color: var(--ink); }
+  .project-entry p { margin: 0; }
+  .primary { color: var(--accent); border-color: var(--accent); padding: 7px 12px; }
+  .selection-list { display: grid; gap: 6px; margin: 12px 0 20px; }
+  .selection-list label { display: flex; gap: 10px; align-items: start; padding: 10px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow-wrap: anywhere; }
+  input[type=checkbox] { accent-color: var(--accent); }
+  .selection-list small { color: var(--muted); }
+  .refresh-box { padding: 14px; border: 1px solid var(--line); background: var(--panel); border-radius: 10px; margin: 18px 0; }
+  progress { width: 100%; height: 12px; accent-color: var(--accent); margin: 10px 0; }
+  #refresh-banner { border-top: 1px solid var(--line); margin-top: 16px; padding: 12px 6px; font-size: 12px; overflow-wrap: anywhere; }
+  .status-complete { color: var(--free); }
+  .status-failed, .status-partial { color: var(--bad); }
+  pre { padding: 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow-x: auto; font-size: 12px; }
+  .docs { max-width: 1000px; }
+  .docs p { max-width: 85ch; }
+  .role-tag { display: inline-block; padding: 1px 5px; border-radius: 4px; color: var(--accent); background: var(--accent-soft); font: 10px system-ui, sans-serif; margin-left: 4px; }
+  .browser-title { display: flex; align-items: center; justify-content: space-between; padding: 0 6px 12px; }
+  .browser-title strong { font-size: 11px; text-transform: uppercase; letter-spacing: .1em; color: var(--muted); }
+  #tree { margin-top: 14px; }
+  .tree-project { margin: 8px 0 12px; }
+  .tree-project summary { cursor: pointer; font-family: var(--mono); font-size: 12px; overflow-wrap: anywhere; padding: 6px; }
+  .tree-button { display: flex; align-items: center; gap: 8px; text-align: left; width: 100%; padding: 7px 10px; border: 0; background: transparent; }
+  .tree-button span { flex: 1; overflow-wrap: anywhere; }
+  .tree-button small { color: var(--muted); font-variant-numeric: tabular-nums; }
+  .tree-button.dataset { padding-left: 22px; font-family: var(--mono); font-size: 11px; }
+  .tree-button:hover, .tree-button.active { background: var(--accent-soft); color: var(--accent); }
+  #scope { padding: 10px 16px 0; font-size: 12px; font-weight: 600; overflow-wrap: anywhere; }
+  .overview-title { font-family: inherit; font-size: 24px; letter-spacing: -.04em; margin-top: 28px; }
+  .eyebrow { color: var(--free); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; margin-top: 24px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(240px, 100%), 1fr)); gap: 12px; margin-top: 20px; }
+  .catalog-card { display: block; text-align: left; padding: 16px; border-radius: 10px; min-width: 0; }
+  .catalog-card strong { display: block; font-family: var(--mono); font-size: 13px; overflow-wrap: anywhere; }
+  .catalog-card .hint { display: block; margin-top: 8px; }
+  .catalog-card p { color: var(--muted); margin: 10px 0 0; font-size: 12px; }
+  .breadcrumbs { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 20px 0 0; color: var(--muted); font-size: 12px; }
+  .breadcrumbs button { border: 0; background: none; color: var(--accent); padding: 0; overflow-wrap: anywhere; }
+  #browser-note { padding: 12px 6px; line-height: 1.6; }
   #results { overflow-y: auto; border-right: 1px solid var(--line); }
   #count { padding: 8px 16px; color: var(--muted); font-size: 12px; border-bottom: 1px solid var(--line); }
   .r { padding: 10px 16px; border-bottom: 1px solid var(--line); cursor: pointer; }
@@ -88,8 +138,16 @@
   .report-total { font-size: 18px; font-weight: 600; margin: 12px 0 4px; }
   .err { color: var(--bad); font-size: 12px; white-space: pre-wrap; }
   .hint { color: var(--muted); font-size: 12px; font-weight: 400; text-transform: none; letter-spacing: 0; }
+  @media (min-width: 761px) and (max-width: 1100px) {
+    main { grid-template-columns: 200px minmax(220px, 30%) minmax(0, 1fr); }
+    #detail { padding-left: 16px; padding-right: 16px; }
+  }
   @media (max-width: 760px) {
-    main { grid-template-columns: 1fr; grid-template-rows: 40% 60%; }
+    body { height: auto; min-height: 100%; }
+    main { display: block; }
+    #browser { max-height: 300px; border-right: 0; border-bottom: 1px solid var(--line); }
+    #app-menu { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    #results { max-height: 300px; }
     #results { border-right: 0; border-bottom: 1px solid var(--line); }
     #detail { padding: 0 16px 16px; }
   }
@@ -100,11 +158,32 @@
   <h1>Sounding<span>BigQuery catalog</span></h1>
   <input id="q" type="search" placeholder="Search tables, columns, descriptions…  (/ to focus)" autofocus autocomplete="off">
   <div id="stats"></div>
-  <button id="report" title="Jobs this identity ran in the job project, with what BigQuery billed (free jobs.list call)">Cost report</button>
 </header>
 <main>
-  <section id="results"><div id="count"></div><div id="list"></div><button id="more" hidden>Load more</button></section>
-  <section id="detail"><div class="empty">Pick a table to see its schema, size and cost.<br>Search and table pages never call BigQuery.</div></section>
+  <nav id="browser" aria-label="Catalog projects and datasets">
+    <div id="app-menu" aria-label="Main menu">
+      <button class="menu-item active" data-page="catalog">Catalog</button>
+      <button class="menu-item" data-page="report">Cost report</button>
+      <button class="menu-item" data-page="refresh">Refresh metadata</button>
+      <button class="menu-item" data-page="docs">Docs &amp; API</button>
+    </div>
+    <div id="catalog-browser">
+    <form id="open-project-form" class="project-entry">
+      <label for="project-id">Open a Google Cloud project</label>
+      <input id="project-id" placeholder="Project ID" required autocomplete="off">
+      <button id="open-project" class="primary" type="submit">Open &amp; import</button>
+      <p class="hint">Imports accessible dataset metadata using existing credentials.</p>
+      <div id="project-error" class="err" role="status"></div>
+    </form>
+    <div class="browser-title"><strong>Catalog</strong><button id="refresh-catalog" title="Reload saved metadata from this computer; does not contact Google Cloud">Reload catalog</button></div>
+    <button id="all-tables" class="tree-button active"><span>All projects</span></button>
+    <div id="tree" aria-live="polite"></div>
+    <p id="browser-note" class="hint">Saved metadata, ready to explore.<br>No sign-in needed to browse.</p>
+    </div>
+    <div id="refresh-banner" hidden aria-live="polite"></div>
+  </nav>
+  <section id="results" aria-label="Tables"><div id="scope">All projects</div><div id="count" aria-live="polite"></div><div id="list"></div><button id="more" hidden>Load more</button></section>
+  <section id="detail" aria-label="Catalog details"><div class="empty">Loading your catalog…</div></section>
 </main>
 <script src="/ui.js" defer></script>
 </body>
