@@ -123,3 +123,24 @@ def test_harvest_project_flag_discovers_multiple_projects_and_deduplicates(monke
 def test_harvest_requires_a_dataset_or_project(monkeypatch, capsys):
     code, output = run(monkeypatch, capsys, "harvest")
     assert code == 2 and "dataset or --project" in output.err
+
+
+def test_import_lists_combine_files_arguments_and_duplicates(tmp_path, monkeypatch, capsys):
+    projects = tmp_path / "projects.txt"
+    projects.write_text("# projects\np, q\np # duplicate\n")
+    datasets = tmp_path / "datasets.json"
+    datasets.write_text('["r.sales", "s.events,r.sales"]')
+    seen = []
+    monkeypatch.setattr(bq, "project_datasets", lambda p: {"datasets":[p + ".d"],"unreachable":[],"receipt":{}})
+    monkeypatch.setattr(bq, "harvest", lambda ds, progress: seen.extend(ds) or {})
+    code, output = run(monkeypatch, capsys, "harvest", "p.d", "--project", "p,q", "--projects-file", str(projects),
+                       "--dataset", "r.sales,t.extra", "--datasets-file", str(datasets))
+    assert code == 0
+    assert sorted(seen) == ["p.d", "q.d", "r.sales", "s.events", "t.extra"]
+
+
+def test_bad_import_file_stops_before_network(tmp_path, monkeypatch, capsys):
+    path = tmp_path / "bad.json"
+    path.write_text('[12]')
+    code, output = run(monkeypatch, capsys, "refresh", "--projects-file", str(path))
+    assert code == 2 and "array of names" in output.err

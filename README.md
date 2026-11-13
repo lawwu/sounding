@@ -235,11 +235,25 @@ uv run sounding routine bigquery-public-data.persistent_udfs.bignumber_add
 
 ### Catalog upgrades
 
-This version uses catalog schema 5. Schema 2, 3 and 4 catalogs are upgraded in place
+This version uses catalog schema 6. Schema 2, 3, 4 and 5 catalogs are upgraded in place
 the first time any Sounding command opens them. Schema 3 adds richer metadata;
-schema 4 adds saved workload reports; schema 5 adds models, row policies, recommendation caches and optional samples. Existing snapshots are preserved, and older
+schema 4 adds saved workload reports; schema 5 adds models, row policies, recommendation caches and optional samples. Schema 6 stores each distinct table schema once in `schemas`, referenced by `tables.schema_hash`, instead of repeating it in each table's resource JSON. Existing snapshots are preserved, and older
 metadata fields stay unknown until the next harvest. Each migration runs in one
 transaction, so a failed step rolls back without changing its starting schema.
+
+Schema deduplication hashes exactly the schema value using SHA-256 over canonical
+JSON (sorted object keys and compact separators). Column/array order and every field
+attribute are preserved. The migration processes bounded batches in one transaction;
+no snapshots, flattened columns, cost estimates or preview rows are removed. Readers
+reconstruct schemas transparently, so CLI, MCP and HTTP/UI output is unchanged.
+This reduces duplicate logical storage and prevents new copies on subsequent harvests.
+
+DuckDB can retain allocated disk blocks after the migration, so the file might not
+immediately shrink. A fresh database copy made with `COPY FROM DATABASE` reclaims
+space; `VACUUM` does not. See [DuckDB's compaction guidance](https://duckdb.org/docs/2.0/operations_manual/footprint_of_duckdb/reclaiming_space).
+Use a scratch copy for validation, close other catalog users before replacing a file,
+and preserve the original until the copied catalog has been verified. Deduplication
+does not prune history or remove other metadata.
 
 Schema 1 catalogs (Sounding before 0.1.0) can't be converted reliably (timezone-less
 timestamps, alias-keyed snapshots). The first time Sounding opens one, it renames it
@@ -325,6 +339,25 @@ uv run sounding table-queries my-project.analytics.orders --days 30 --project jo
 ```
 
 `harvest --project` uses the same project discovery and progress flow as `refresh`.
+Both commands accept comma-separated names, repeatable `--dataset` / `--project` flags,
+and repeatable `--datasets-file` / `--projects-file` inputs. Files may be JSON arrays
+of strings or text lists separated by commas/whitespace with `#` comments.
+
+```sh
+sounding harvest project-a.sales --project project-b,project-c \
+  --dataset project-d.events,project-e.logs \
+  --projects-file projects.txt --datasets-file datasets.json
+```
+
+The Cost report also ranks the top 20 exact-SQL groups or individual runs by billed
+bytes, slot time or execution count. Identical SQL combines across parameter values;
+different SQL literals or formatting remain separate. Default dataset, dialect and
+location are part of the grouping key. Missing SQL stays ungrouped, missing metrics
+are explicit, and script children are excluded from totals to avoid double counting.
+Rankings cover at most the newest 1,000 jobs for the current identity in the configured
+job project. **Show query** reads SQL on demand through free `jobs.get`; it does not
+execute or persist it. Scan list-price estimates are not billing invoices.
+
 Repeat `--project` for multiple projects; explicit datasets can be included and are deduplicated.
 `refresh` and project-level `harvest` print final JSON to stdout and terminal progress to stderr; partial or
 failed refreshes exit with code 2. A request accepts up to 25 projects and 1000

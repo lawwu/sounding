@@ -546,12 +546,53 @@ async function costReport(hours = 24) {
       <div class="chips">${windows.map(([h, label]) => `<button data-hours="${h}"${h === r.hours ? " disabled" : ""}>${label}</button>`).join("")}</div>
       <div class="report-total num">${r.job_count} jobs · ${r.billed_bytes == null ? "billed bytes unknown" : `${bytes(r.billed_bytes)} billed`} · ${usd(r.usd_on_demand)}</div>
       <div class="hint">${esc(new Date(r.since).toLocaleString())} – ${esc(new Date(r.until).toLocaleString())}<br>${esc(r.source)}<br>${esc(r.price_basis)}${r.warnings.length ? "<br>" + r.warnings.map(esc).join("<br>") : ""}</div>
-      ${r.jobs.length ? `<h3>Jobs</h3><div class="scroll"><table><thead><tr><th>Created</th><th>Job</th><th>Type</th><th>State</th><th>Billed</th><th>List price</th><th>Cache</th></tr></thead><tbody>
-        ${r.jobs.map(j => `<tr><td>${esc(new Date(j.created).toLocaleString())}</td><td class="path">${esc(j.job_id)}</td><td>${esc(j.statement_type || j.type)}</td><td>${esc(j.state)}</td>
-          <td class="num">${bytes(j.billed_bytes)}</td><td class="num">${usd(j.usd_on_demand)}</td><td>${j.cache_hit ? "hit" : ""}</td></tr>`).join("")}</tbody></table></div>`
+      <h3>Top offending queries</h3><div class="toolbar"><label>Compare<select id="offender-mode"><option value="groups">Repeated queries combined</option><option value="runs">Individual runs</option></select></label><label>Rank by<select id="offender-rank"><option value="bytes">Billed bytes / scan cost</option><option value="slots">Slot time</option><option value="runs">Execution count</option></select></label></div><p class="hint">Top 20 within the scanned history. Repeated queries match exact SQL, including formatting and literals. Slot time helps identify heavy capacity workloads; scan list prices are not your invoice.</p><div id="offenders"></div>
+      ${r.jobs.length ? `<h3>Jobs</h3><p class="hint">Show query fetches SQL on demand using the free jobs API. It does not execute or save the query.</p><div class="scroll"><table><thead><tr><th>Created</th><th>Job</th><th>Type</th><th>State</th><th>Billed</th><th>List price</th><th>Cache</th><th>Query</th></tr></thead><tbody>
+        ${r.jobs.map((j, i) => `<tr><td>${esc(new Date(j.created).toLocaleString())}</td><td class="path">${esc(j.job_id)}</td><td>${esc(j.statement_type || j.type)}</td><td>${esc(j.state)}</td>
+          <td class="num">${bytes(j.billed_bytes)}</td><td class="num">${usd(j.usd_on_demand)}</td><td>${j.cache_hit ? "hit" : ""}</td><td>${j.type === "query" ? `<button data-report-query="${i}">Show query</button>` : "—"}</td></tr>${j.type === "query" ? `<tr id="report-query-row-${i}" hidden><td colspan="8"><div id="report-query-${i}"></div></td></tr>` : ""}`).join("")}</tbody></table></div>`
         : `<div class="receipt">✓ No jobs: nothing you ran in this project during this window could have been billed.</div>`}`;
     $("#detail").querySelectorAll("[data-hours]").forEach(b => b.onclick = () => costReport(Number(b.dataset.hours)));
+    const rank = () => renderCostRanking(r, my);
+    $("#offender-mode").onchange = rank; $("#offender-rank").onchange = rank; rank();
+    $("#detail").querySelectorAll("[data-report-query]").forEach(b => {
+      const i = Number(b.dataset.reportQuery), job = r.jobs[i];
+      b.onclick = () => showReportQuery(job, i, b, my);
+    });
   } catch (err) { if (my === viewSeq) $("#detail").innerHTML = `<div class="err">${esc(err.message)}</div>`; }
+}
+
+function renderCostRanking(report, view) {
+  const groups = $("#offender-mode").value !== "runs";
+  const rows = groups ? [...(report.query_groups || [])] : report.jobs.filter(j => j.type === "query" && !j.parent_job_id).map(j => ({
+    representative:j, executions:1, known_billed_bytes:j.billed_bytes || 0, known_slot_ms:j.slot_ms || 0,
+    unknown_billed:j.billed_bytes == null ? 1 : 0, unknown_slots:j.slot_ms == null ? 1 : 0, usd_on_demand:j.usd_on_demand}));
+  const field = {slots:"known_slot_ms",runs:"executions"}[$("#offender-rank").value] || "known_billed_bytes";
+  rows.sort((a,b) => b[field] - a[field]);
+  const top = rows.slice(0,20), generation = ++renderSeq;
+  $("#offenders").innerHTML = top.length ? `<div class="scroll"><table><thead><tr><th>Rank / representative job</th><th>Runs</th><th>Total billed</th><th>Scan list price</th><th>Slot seconds</th><th>SQL</th></tr></thead><tbody>${top.map((g,i) => `<tr><td>${i+1}. <code>${esc(g.representative.job_id)}</code>${groups && g.grouped === false ? '<br><small>SQL unavailable; ungrouped</small>' : ""}</td><td>${num(g.executions)}</td><td>${bytes(g.known_billed_bytes)}${g.unknown_billed ? ` + ${g.unknown_billed} unknown` : ""}</td><td>${usd(g.usd_on_demand)}</td><td>${num(g.known_slot_ms / 1000)}${g.unknown_slots ? ` + ${g.unknown_slots} unknown` : ""}</td><td><button data-offender="${i}">Show query</button></td></tr><tr id="report-query-row-top-${generation}-${i}" hidden><td colspan="6"><div id="report-query-top-${generation}-${i}"></div></td></tr>`).join("")}</tbody></table></div>` : '<p class="hint">No query jobs in the scanned history.</p>';
+  $("#offenders").querySelectorAll("[data-offender]").forEach(button => {
+    const i = Number(button.dataset.offender);
+    button.onclick = () => showReportQuery(top[i].representative, `top-${generation}-${i}`, button, view);
+  });
+}
+
+async function showReportQuery(job, index, button, view) {
+  const active = () => view === viewSeq && appPage === "report";
+  if (!active()) return;
+  const row = $("#report-query-row-" + index), out = $("#report-query-" + index);
+  if (button.dataset.loaded) {
+    row.hidden = !row.hidden;
+    button.textContent = row.hidden ? "Show query" : "Hide query";
+    return;
+  }
+  row.hidden = false; button.disabled = true; out.textContent = "Loading query…";
+  try {
+    const result = await api("/api/inspect-job", {job_id:job.job_id, project:job.project, location:job.location, include_sql:true});
+    if (!active()) return;
+    out.innerHTML = `<pre>${esc(result.sql ?? "Query text is unavailable for this job.")}</pre>${result.sql_truncated ? '<p class="hint">Query text was truncated.</p>' : ""}${receiptHtml(result.receipt)}`;
+    button.dataset.loaded = "true"; button.textContent = "Hide query";
+  } catch (err) { if (active()) out.textContent = err.message; }
+  finally { if (active()) button.disabled = false; }
 }
 
 let timer;

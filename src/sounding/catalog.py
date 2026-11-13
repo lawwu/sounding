@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import hashlib
 import os
 import sys
 import uuid
@@ -22,7 +23,7 @@ from .errors import CatalogBusy, CatalogVersionError, MissingTable, integer, tex
 
 CATALOG = Path(os.environ.get("SOUNDING_CATALOG", Path.home() / ".sounding" / "catalog.duckdb"))
 LOCK_TIMEOUT = 10
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 USD_PER_TIB = 6.25  # US on-demand list price; excludes discounts and the monthly free tier.
 TIB = 1024**4
 MIB = 1024**2
@@ -106,6 +107,11 @@ CREATE TABLE recommendation_cache (
 CREATE TABLE projects (project VARCHAR PRIMARY KEY, imported_at TIMESTAMPTZ);
 UPDATE catalog_meta SET version = 5;
 """,
+    5: """
+CREATE TABLE schemas (schema_hash VARCHAR PRIMARY KEY, schema JSON NOT NULL);
+ALTER TABLE tables ADD COLUMN schema_hash VARCHAR;
+UPDATE catalog_meta SET version = 6;
+""",
 }
 JSON_FIELDS = {"labels", "foreign_keys", "storage", "external", "materialized_view", "resource", "arguments",
                "row_access_policies", "feature_columns", "label_columns", "remote_info", "items", "preview_rows"}
@@ -134,6 +140,7 @@ TABLE_SCHEMA = pa.schema([
     ("row_access_policies_message", pa.string()),
     ("preview_rows", pa.string()), ("preview_status", pa.string()), ("preview_message", pa.string()),
     ("preview_sampled_at", _TS),
+    ("schema_hash", pa.string()),
 ])
 COLUMN_SCHEMA = pa.schema([
     ("snapshot_id", pa.int64()), ("fqn", pa.string()), ("path", pa.string()),
@@ -197,18 +204,76 @@ def _set_aside(path: Path, version: int | None) -> Path:
 
 def _migrate(path: Path, version: int) -> None:
     """Apply additive migrations in place, in one transaction per step."""
+    original_version = version
     with _open(path, write=True) as con:
         while version < SCHEMA_VERSION:
             con.execute("BEGIN")
             try:
                 con.execute(MIGRATIONS[version])
+                if version == 5:
+                    _deduplicate_schemas(con)
                 con.execute("COMMIT")
             except BaseException:
                 con.execute("ROLLBACK")
                 raise
             version = _version(con)
-    print(f"sounding: upgraded the catalog to schema {SCHEMA_VERSION}. Older snapshots show new "
-          "fields as unknown until you harvest again.", file=sys.stderr)
+    message = "Schema storage is deduplicated; existing data and snapshots are unchanged."
+    if original_version < 5:
+        message += " Fields introduced after your original version remain unknown until harvested."
+    print(f"sounding: upgraded the catalog to schema {SCHEMA_VERSION}. {message}", file=sys.stderr)
+
+
+def _extract_schema(row):
+    """Return a new row and canonical schema; preserve array order and every field."""
+    row = dict(row)
+    resource = row.get("resource")
+    if isinstance(resource, str):
+        resource = json.loads(resource)
+    schema = resource.get("schema") if resource is not None else None
+    if schema is None:
+        row["schema_hash"] = None
+        return row, None
+    canonical = json.dumps(schema, sort_keys=True, separators=(",", ":"))
+    row["schema_hash"] = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    row["resource"] = {k: v for k, v in resource.items() if k != "schema"}
+    return row, canonical
+
+
+def _store_schemas(con, schemas):
+    if not schemas:
+        return
+    batch = pa.table({"schema_hash": list(schemas), "schema": list(schemas.values())})
+    con.register("schema_batch", batch)
+    try:
+        con.execute('INSERT INTO schemas SELECT schema_hash, schema::JSON FROM schema_batch ON CONFLICT DO NOTHING')
+    finally:
+        con.unregister("schema_batch")
+
+
+def _deduplicate_schemas(con, batch_size=256):
+    """Bounded batches within the caller's migration transaction; safe to rerun."""
+    last = -1
+    while True:
+        rows = con.execute("""SELECT rowid, resource FROM tables
+            WHERE rowid > ? AND schema_hash IS NULL AND resource IS NOT NULL
+            ORDER BY rowid LIMIT ?""", [last, batch_size]).fetchall()
+        if not rows:
+            break
+        last = rows[-1][0]
+        schemas, updates = {}, []
+        for rowid, resource in rows:
+            row, schema = _extract_schema({"resource": resource})
+            if schema is not None:
+                schemas[row["schema_hash"]] = schema
+                updates.append({"rid": rowid, "schema_hash": row["schema_hash"], "resource": json.dumps(row["resource"], sort_keys=True)})
+        _store_schemas(con, schemas)
+        if updates:
+            con.register("schema_updates", pa.Table.from_pylist(updates))
+            try:
+                con.execute("""UPDATE tables SET schema_hash=u.schema_hash, resource=u.resource::JSON
+                    FROM schema_updates u WHERE tables.rowid=u.rid""")
+            finally:
+                con.unregister("schema_updates")
 
 
 def _open(path: Path, write: bool):
@@ -273,6 +338,15 @@ def save_snapshot(dataset: str, table_rows: list[dict], col_rows: list[dict],
             con.execute("INSERT INTO snapshots VALUES (?, ?, ?)", [sid, dt.datetime.now(dt.UTC), dataset])
             for name, rows, schema in batches:
                 if rows:
+                    if name == "tables":
+                        prepared, schemas = [], {}
+                        for row in rows:
+                            row, canonical = _extract_schema(row)
+                            prepared.append(row)
+                            if canonical is not None:
+                                schemas[row["schema_hash"]] = canonical
+                        _store_schemas(con, schemas)
+                        rows = prepared
                     batch = pa.Table.from_pylist([_encode(dict(row, snapshot_id=sid)) for row in rows], schema=schema)
                     con.register("batch", batch)
                     # Explicit Arrow fields and BY NAME avoid depending on dict/DDL column ordering.
@@ -465,6 +539,12 @@ def describe(con, fqn: str) -> dict:
         raise MissingTable("Table is not in the latest catalog snapshot; harvest its dataset first.")
     out = {k: _decode(k, v) for k, v in zip([d[0] for d in cur.description], row)}
     resource = out.pop("resource", None) or {}
+    schema_hash = out.pop("schema_hash", None)
+    if schema_hash is not None:
+        stored = con.execute("SELECT schema FROM schemas WHERE schema_hash=?", [schema_hash]).fetchone()
+        if stored is None:
+            raise CatalogVersionError("Catalog schema reference is missing; the catalog may be damaged.")
+        resource["schema"] = json.loads(stored[0])
     kind, _, field = (out["partitioning"] or "").partition(":")
     out["partition"] = ({"kind": kind, "field": field, "ingestion_time": field == "_PARTITIONTIME",
                          "range": (resource.get("rangePartitioning") or {}).get("range")}

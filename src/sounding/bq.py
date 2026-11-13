@@ -12,6 +12,7 @@ import decimal
 import logging
 import json
 import math
+import hashlib
 import os
 import sys
 import threading
@@ -61,7 +62,8 @@ def project_datasets(project: str) -> dict:
 
 
 # Fields dropped before a REST resource is stored. View SQL is stored in its own
-# column. Keep the original schema too, so newer field metadata survives harvests.
+# column. Pass the original schema through to the catalog writer, which stores it
+# once by content hash so newer field metadata survives without per-table copies.
 # Dataset `access` lists the people and groups with access (emails),
 # which a metadata catalog has no reason to keep.
 TABLE_DROP = {"view", "etag", "selfLink", "id", "kind"}
@@ -632,22 +634,48 @@ def cost_report(hours: int = 24) -> dict:
     c = client()
     now = dt.datetime.now(dt.UTC)
     since = now - dt.timedelta(hours=hours)
-    jobs = list(c.list_jobs(min_creation_time=since, max_results=COST_REPORT_MAX_JOBS + 1))
+    try:
+        jobs = list(c.list_jobs(min_creation_time=since, max_results=COST_REPORT_MAX_JOBS + 1))
+    finally:
+        c.close()
     truncated = len(jobs) > COST_REPORT_MAX_JOBS
     rows = []
     for job in jobs[:COST_REPORT_MAX_JOBS]:
         stats = job._properties.get("statistics", {})
         query = stats.get("query", {})
         billed = query.get("totalBytesBilled")
-        rows.append({"job_id": job.job_id, "type": job.job_type, "state": job.state,
+        config = job._properties.get("configuration", {}).get("query", {})
+        sql = config.get("query")
+        # Exact SQL + execution context, not a guessed normalized query family.
+        group_key = hashlib.sha256(json.dumps([sql, config.get("defaultDataset"), config.get("useLegacySql"), job.location], sort_keys=True).encode()).hexdigest() if sql else None
+        rows.append({"job_id": job.job_id, "project": job.project or c.project, "location": job.location,
+                     "type": job.job_type, "state": job.state,
+                     "query_key": group_key, "parent_job_id": stats.get("parentJobId"),
                      "created": _iso(job.created), "statement_type": query.get("statementType"),
                      "billed_bytes": None if billed is None else int(billed),
                      "cache_hit": query.get("cacheHit"), "slot_ms": _int(stats.get("totalSlotMs")),
                      "usd_on_demand": None if billed is None else catalog.usd(int(billed))})
-    query_rows = [r for r in rows if r["type"] == "query"]
+    query_rows = [r for r in rows if r["type"] == "query" and not r["parent_job_id"]]
+    groups = {}
+    for row in query_rows:
+        key = row["query_key"] or "job:" + row["job_id"]
+        group = groups.setdefault(key, {"key": key, "executions": 0, "known_billed_bytes": 0, "known_slot_ms": 0,
+            "unknown_billed": 0, "unknown_slots": 0, "cache_hits": 0, "representative": row, "grouped": row["query_key"] is not None})
+        group["executions"] += 1
+        group["known_billed_bytes"] += row["billed_bytes"] or 0
+        group["known_slot_ms"] += row["slot_ms"] or 0
+        group["unknown_billed"] += row["billed_bytes"] is None
+        group["unknown_slots"] += row["slot_ms"] is None
+        group["cache_hits"] += bool(row["cache_hit"])
+        if (row["billed_bytes"] or 0) > (group["representative"]["billed_bytes"] or 0):
+            group["representative"] = row
+    ranked = sorted(groups.values(), key=lambda g: -g["known_billed_bytes"])
+    for group in ranked:
+        group["usd_on_demand"] = catalog.usd(group["known_billed_bytes"]) if not group["unknown_billed"] else None
     unknown = [r for r in query_rows if r["billed_bytes"] is None]
     billed_total = None if unknown else sum(r["billed_bytes"] for r in query_rows)
     warnings = []
+    warnings.append("Query groups match exact SQL and execution context; different literals or formatting remain separate. Missing SQL stays ungrouped. Rankings cover only scanned jobs for this identity and job project; child jobs are excluded from totals to avoid double counting scripts.")
     if truncated:
         warnings.append(f"More than {COST_REPORT_MAX_JOBS} jobs; only the newest are listed. Use a shorter window.")
     if unknown:
@@ -659,7 +687,7 @@ def cost_report(hours: int = 24) -> dict:
     return {"project": c.project, "since": since.isoformat(), "until": now.isoformat(), "hours": hours,
             "job_count": len(rows), "query_jobs": len(query_rows), "billed_bytes": billed_total,
             "usd_on_demand": None if billed_total is None else catalog.usd(billed_total),
-            "price_basis": PRICE_BASIS, "jobs": rows, "truncated": truncated, "warnings": warnings,
+            "price_basis": PRICE_BASIS, "jobs": rows, "query_groups": ranked, "truncated": truncated, "warnings": warnings,
             "source": "BigQuery jobs.list (free) for jobs your identity ran in this project. Dry runs, "
                       "metadata calls and previews never create jobs, so they never appear. Jobs billed "
                       "to other projects are not shown; your billing report is the final word."}

@@ -22,6 +22,7 @@
     <p>Imports are metadata-only by default. <b>Load 10 rows</b> on a table explicitly fetches and saves a small sample using free <code>tabledata.list</code>. The CLI flag <code>--include-preview-rows</code> includes samples during harvest or refresh and prints a warning: <b>this can add a material delay</b>. It requires permission to read the actual data.</p>
     <p>Samples have arbitrary order, a timestamp, and a limit of 10 rows / 256 KiB of saved JSON per native table or snapshot. This storage limit does not bound the API response size. Views and external tables are not queried. A normal metadata-only refresh does not carry samples into the new snapshot; older snapshots can still contain previously saved data.</p>
     <h3>Table query history</h3>
+    <p>The Cost report's <b>Show query</b> button expands a query job's SQL using free <code>jobs.get</code>. Query text is fetched only when requested, can be hidden again, and is not executed or saved to the catalog. Unavailable or truncated SQL is labeled.</p>
     <p>Choose 1–180 days (default 30), the job project and visibility, then load the top individual query jobs by billed bytes or slot time. The job project can differ from the table's project. “My jobs” is the current identity; project-wide metadata may require <code>bigquery.jobs.listAll</code>.</p>
     <p>The free lookup scans at most the newest 1,000 completed top-level jobs. It matches reported table or logical-view references; scripts' children, missing references and other job projects are not included. Warnings identify truncation or unreachable locations. An empty result does not establish no usage. Metrics are whole-job totals, not a table's allocated share. SQL appears only when you choose “Show SQL &amp; details” and is not saved.</p>
     <p>Workload opportunity scans are separate: their default is a free preview; executing a billed scan requires explicit opt-in and a byte cap. See the CLI and MCP references.</p>
@@ -40,6 +41,10 @@ sounding dataset my-project.analytics</pre>
     <pre>sounding model my-project.analytics.revenue_model
 sounding recommendations my-project</pre>
     <h3>Refresh with progress</h3>
+    <p>Combine positional datasets with repeatable <code>--project</code> and <code>--dataset</code> flags. Each accepts comma-separated names. <code>--projects-file</code> and <code>--datasets-file</code> accept text lists (commas/whitespace, # comments) or JSON arrays of strings, and can be repeated. Duplicates and overlapping discoveries are removed. The UI's Refresh metadata page also combines selections with comma-separated project and dataset inputs.</p>
+    <pre>sounding harvest project-a.sales --project project-b,project-c \
+  --dataset project-d.events,project-e.logs \
+  --projects-file projects.txt --datasets-file datasets.json</pre>
     <pre># Selected datasets
 sounding refresh my-project.analytics other-project.sales
 
@@ -56,6 +61,7 @@ sounding harvest my-project.analytics --include-preview-rows
 sounding refresh --project my-project --include-preview-rows</pre>
     <p>Refresh and project-level harvest print the final result as JSON to stdout and progress to stderr. Partial or failed imports exit with code 2. One refresh per catalog can run at a time; reads remain available. Repeat <code>--project</code> to include several projects; explicitly named datasets are combined with discovered datasets without duplicates.</p>
     <h3>Inspect cost and usage</h3>
+    <p>The Cost report ranks the top 20 individual runs or exact-SQL groups by total billed bytes, slot time or execution count. Rankings cover the scanned history (at most the newest 1,000 jobs for the current identity in the configured job project). Missing metrics are labeled; script child jobs are excluded from totals to avoid double counting. SQL text appears only through Show query. Different literals and formatting remain separate; normalized-query analysis is available through the explicitly billed query-opportunities command.</p>
     <pre>sounding column-costs my-project.analytics.orders
 sounding estimate 'SELECT order_id FROM `my-project.analytics.orders`'
 sounding preview my-project.analytics.orders
