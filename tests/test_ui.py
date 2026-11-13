@@ -70,10 +70,11 @@ def test_duplicate_host_is_rejected(server):
     con.close()
 
 
-@pytest.mark.parametrize("path,body",[("/api/estimate",{"sql":"SELECT 1"}),("/api/column-costs",{"fqn":"p.d.orders"}),("/api/preview",{"fqn":"p.d.orders"}),("/api/cost-report",{"hours":24})])
+@pytest.mark.parametrize("path,body",[("/api/estimate",{"sql":"SELECT 1"}),("/api/column-costs",{"fqn":"p.d.orders"}),("/api/preview",{"fqn":"p.d.orders"}),("/api/refresh-sample",{"fqn":"p.d.orders"}),("/api/cost-report",{"hours":24}), ("/api/refresh",{"projects":["p"]}), ("/api/table-queries",{"table":"p.d.orders"}), ("/api/inspect-job",{"job_id":"j","location":"US"})])
 def test_simple_cross_origin_posts_never_invoke_bigquery(server,monkeypatch,path,body):
     action=Mock(side_effect=AssertionError("must reject before dispatch"))
-    for name in ["dry_run","column_costs","preview","cost_report"]: monkeypatch.setattr(bq,name,action)
+    for name in ["dry_run","column_costs","preview","refresh_sample","cost_report", "table_queries", "inspect_query_job"]: monkeypatch.setattr(bq,name,action)
+    monkeypatch.setattr(server.refresh, 'start', action)
     headers={"Origin":"https://attacker.invalid","Content-Type":"text/plain","Sec-Fetch-Site":"cross-site"}
     assert request(server,path,"POST",json.dumps(body),headers,authorized=False)[0]==403
     # Even a known token does not permit a hostile origin or a simple content type.
@@ -140,3 +141,37 @@ def test_port_boundaries_do_not_overflow(monkeypatch):
     assert calls==[65535]
     for port in [-1,65536]:
         with pytest.raises(ValueError): ui.bind(port)
+
+
+def test_browse_and_dataset_are_local_and_scoped(server, seed):
+    seed([table_row('second.d.orders')], [], dataset='second.d')
+    seed([], [], dataset='second.empty')
+    tree = json.loads(request(server, '/api/browse')[2])
+    assert [p['project'] for p in tree['projects']] == ['p', 'second']
+    assert tree['projects'][1]['datasets'][1]['tables'] == 0
+    page = json.loads(request(server, '/api/search?project=second&dataset=second.d')[2])
+    assert [r['table'] for r in page['items']] == ['second.d.orders']
+    dataset = json.loads(request(server, '/api/dataset?dataset=second.empty')[2])
+    assert dataset['tables'] == 0 and dataset['routines'] == []
+    assert request(server, '/api/dataset?dataset=second.missing')[0] == 404
+    assert request(server, '/api/browse', authorized=False)[0] == 403
+    assert request(server, '/api/dataset?dataset=p.d', authorized=False)[0] == 403
+
+
+def test_refresh_and_history_endpoints_and_local_docs(server, monkeypatch):
+    started = Mock(return_value={'id':'j','status':'running'})
+    monkeypatch.setattr(server.refresh, 'start', started)
+    assert request(server, '/api/refresh', 'POST', json.dumps({'datasets':['p.d'],'projects':['q']}))[0] == 202
+    started.assert_called_once_with(['p.d'], ['q'])
+    assert json.loads(request(server, '/api/refresh')[2]) == {'status':'idle'}
+    assert request(server, '/api/refresh', authorized=False)[0] == 403
+    query = Mock(return_value={'jobs':[]})
+    monkeypatch.setattr(bq, 'table_queries', query)
+    assert request(server, '/api/table-queries', 'POST', json.dumps({'table':'p.d.orders'}))[0] == 200
+    query.assert_called_once_with('p.d.orders', 30, project=None, scope='user', rank_by='billed_bytes', limit=20)
+    inspect = Mock(return_value={'sql':None})
+    monkeypatch.setattr(bq, 'inspect_query_job', inspect)
+    assert request(server, '/api/inspect-job', 'POST', json.dumps({'job_id':'j','location':'US'}))[0] == 200
+    assert inspect.call_args.kwargs['include_sql'] is False
+    docs = json.loads(request(server, '/api/docs')[2])['html']
+    assert 'MCP' in docs and 'CLI' in docs and '/api/refresh' in docs

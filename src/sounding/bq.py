@@ -10,15 +10,20 @@ import base64
 import datetime as dt
 import decimal
 import logging
+import json
+import math
 import os
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import quote
 
-from google.api_core.exceptions import Forbidden, NotFound
+from google.api_core.exceptions import Forbidden, NotFound, GoogleAPIError, TooManyRequests
+from google.auth.exceptions import GoogleAuthError
 from google.cloud import bigquery
+from requests.exceptions import RequestException
 
-from . import catalog, workload
+from . import catalog, workload, recommendations
 from .progress import Quiet
 from .errors import SoundingError, integer, text, public_error
 
@@ -32,16 +37,34 @@ PRICING_DOC = "https://cloud.google.com/bigquery/pricing#free"
 COST_REPORT_MAX_HOURS = 180 * 24  # BigQuery keeps job history for 180 days
 COST_REPORT_MAX_JOBS = 1000
 PSEUDO_PARTITION_COLUMNS = {"_PARTITIONTIME", "_PARTITIONDATE"}  # ingestion-time partitioning
+SAMPLE_ROWS = 10
+SAMPLE_BYTES = 256 * 1024  # stored UTF-8 JSON per table, not a network transfer cap
 
 
 def client() -> bigquery.Client:
     return bigquery.Client(project=JOB_PROJECT)
 
 
-# Fields dropped before a REST resource is stored. The schema and view SQL are stored in
-# their own columns. Dataset `access` lists the people and groups with access (emails),
+def project_datasets(project: str) -> dict:
+    """Discover every visible, non-hidden dataset using the free paginated API."""
+    workload.identifier(project, "project")
+    c = client()
+    datasets, unreachable = [], set()
+    try:
+        for page in c.list_datasets(project=project, page_size=1000, timeout=30).pages:
+            unreachable.update((page._raw_page or {}).get("unreachable", []))
+            datasets.extend(f"{d.project}.{d.dataset_id}" for d in page)
+    finally:
+        c.close()
+    return {"datasets": sorted(set(datasets)), "unreachable": sorted(unreachable),
+            "receipt": free_api_receipt("datasets.list")}
+
+
+# Fields dropped before a REST resource is stored. View SQL is stored in its own
+# column. Keep the original schema too, so newer field metadata survives harvests.
+# Dataset `access` lists the people and groups with access (emails),
 # which a metadata catalog has no reason to keep.
-TABLE_DROP = {"schema", "view", "etag", "selfLink", "id", "kind"}
+TABLE_DROP = {"view", "etag", "selfLink", "id", "kind"}
 DATASET_DROP = {"access", "etag", "selfLink", "id", "kind"}
 ROUTINE_DROP = {"etag"}
 STORAGE_FIELDS = {  # tables.get returns these by default; any may be absent (unknown).
@@ -164,8 +187,58 @@ def routine_record(r: dict, dataset: str) -> dict:
             "resource": {k: v for k, v in r.items() if k not in ROUTINE_DROP}}
 
 
-def harvest(datasets: list[str], progress: Quiet | None = None) -> dict:
-    """Free metadata calls only: datasets.get, tables.list/get and routines.list/get.
+OPTIONAL_ERRORS = (GoogleAPIError, GoogleAuthError, RequestException)
+
+
+def metadata_failure(error):
+    status = "denied" if isinstance(error, Forbidden) else "quota" if isinstance(error, TooManyRequests) else "unavailable"
+    return status, {"denied": "Access was denied for this metadata.", "quota": "The metadata read quota was reached.",
+                    "unavailable": "This metadata could not be read during refresh."}[status]
+
+
+def model_record(r, dataset, status="harvested", message=None):
+    ref = r["modelReference"]
+    def columns(key):
+        return [{"name": c.get("name"), "type": sql_type(c.get("type"))} for c in r.get(key, [])] if key in r else None
+    return {"dataset": dataset, "model_id": ref["modelId"], "fqn": _ref(ref, "modelId"),
+            "type": r.get("modelType"), "friendly_name": r.get("friendlyName"), "description": r.get("description"),
+            "labels": r.get("labels"), "location": r.get("location"), "created": _ms(r.get("creationTime")),
+            "modified": _ms(r.get("lastModifiedTime")), "expires": _ms(r.get("expirationTime")),
+            "feature_columns": columns("featureColumns"), "label_columns": columns("labelColumns"),
+            "remote_info": r.get("remoteModelInfo"), "metadata_status": status, "metadata_message": message}
+
+
+def row_access_policies(c, table):
+    """Paginated REST adapter: the Python BigQuery SDK has no list method yet."""
+    if table.table_type not in ("TABLE", "SNAPSHOT"):
+        return {"row_access_policies": None, "row_access_policies_status": "not_applicable", "row_access_policies_message": None}
+    ref = table.reference
+    path = "/projects/{}/datasets/{}/tables/{}/rowAccessPolicies".format(
+        *(quote(v, safe="") for v in (ref.project, ref.dataset_id, ref.table_id)))
+    policies, token, seen = [], None, set()
+    try:
+        while True:
+            params = {"pageSize": 1000}
+            if token:
+                params["pageToken"] = token
+            page = c._call_api(retry=None, method="GET", path=path, query_params=params, timeout=30)
+            # Do not call getIamPolicy or store membership/grantee lists.
+            policies.extend({k: p[k] for k in ("rowAccessPolicyReference", "filterPredicate", "creationTime", "lastModifiedTime") if k in p}
+                            for p in page.get("rowAccessPolicies", []))
+            token = page.get("nextPageToken")
+            if not token:
+                return {"row_access_policies": policies, "row_access_policies_status": "harvested", "row_access_policies_message": None}
+            if token in seen:
+                return {"row_access_policies": None, "row_access_policies_status": "unavailable",
+                        "row_access_policies_message": "Row policy pagination did not complete."}
+            seen.add(token)
+    except OPTIONAL_ERRORS as error:
+        status, message = metadata_failure(error)
+        return {"row_access_policies": None, "row_access_policies_status": status, "row_access_policies_message": message}
+
+
+def harvest(datasets: list[str], progress: Quiet | None = None, *, include_preview_rows: bool = False) -> dict:
+    """Free metadata calls only, including models, row policies and cached recommendations.
 
     Datasets are crawled concurrently, each publishing its own snapshot, so a failure
     leaves only that dataset's previous snapshot current. Every dataset is attempted;
@@ -184,7 +257,8 @@ def harvest(datasets: list[str], progress: Quiet | None = None) -> dict:
             refs.append(bigquery.DatasetReference.from_string(raw_ds, default_project=c.project))
         except ValueError as error:
             raise SoundingError("Dataset must be dataset or project.dataset.") from error
-    counts = {"datasets.get": 0, "tables.get": 0, "routines.get": 0}
+    counts = {"datasets.get": 0, "tables.get": 0, "routines.get": 0, "models.get": 0}
+    coverage = {}
     counts_lock = threading.Lock()
     progress.add(len(refs))  # one unit per dataset's list calls; tables and routines add theirs
 
@@ -219,21 +293,89 @@ def harvest(datasets: list[str], progress: Quiet | None = None) -> dict:
             except Forbidden:
                 # Routine access is a separate permission; tables are still worth keeping.
                 routines, routines_status = [], "denied"
+            model_rows, models_status, models_message = [], "harvested", None
+            try:
+                listed_models = list(c.list_models(ds, page_size=1000, timeout=30, retry=None))
+                progress.add(len(listed_models))
+                def get_model(model):
+                    try:
+                        return model_record(c.get_model(model.reference, timeout=30, retry=None).to_api_repr(), ds)
+                    except OPTIONAL_ERRORS as error:
+                        return model_record(model.to_api_repr(), ds, *metadata_failure(error))
+                    finally:
+                        progress.advance()
+                model_rows = list(pool.map(get_model, listed_models))
+                if any(m["metadata_status"] != "harvested" for m in model_rows):
+                    models_status, models_message = "partial", "Model inventory was saved, but some model details were unavailable."
+            except OPTIONAL_ERRORS as error:
+                models_status, models_message = metadata_failure(error)
+            progress.add(len(fetched))
+            def get_policies(table):
+                try:
+                    return row_access_policies(c, table)
+                finally:
+                    progress.advance()
+            policy_rows = list(pool.map(get_policies, fetched))
         table_rows, col_rows = [], []
-        for t in fetched:
+        for t, policies in zip(fetched, policy_rows):
             table, columns = table_record(t.to_api_repr(), ds)
+            table.update(policies)
+            table["preview_status"] = ("pending" if include_preview_rows else "not_requested") if t.table_type in ("TABLE", "SNAPSHOT") else "not_applicable"
             table_rows.append(table)
             col_rows += columns
         routine_rows = [routine_record(r.to_api_repr(), ds) for r in routines]
-        sid = catalog.save_snapshot(ds, table_rows, col_rows,
-                                    dataset_record(dataset_resource, ds, routines_status), routine_rows)
-        progress.advance()
+        dataset_row = dataset_record(dataset_resource, ds, routines_status) | {"models_status": models_status, "models_message": models_message}
+        sid = catalog.save_snapshot(ds, table_rows, col_rows, dataset_row, routine_rows, model_rows)
+        progress.advance()  # Metadata is browseable before sample downloads finish.
+        def get_sample(table):
+            try:
+                sample = table_sample(c, table)
+                fqn = _ref(table.to_api_repr()["tableReference"])
+                catalog.save_sample(fqn, sid, sample)
+                return sample
+            except Exception as error:
+                logging.warning("Sample import failed (%s)", type(error).__name__)
+                return {"preview_status": "unavailable"}
+            finally:
+                progress.advance()
+        sample_rows = []
+        if include_preview_rows:
+            progress.add(len(fetched))
+            with ThreadPoolExecutor(GET_TABLE_WORKERS) as pool:
+                sample_rows = list(pool.map(get_sample, fetched))
+        warnings = []
+        if models_status != "harvested":
+            warnings.append(models_message)
+        if routines_status != "harvested":
+            warnings.append("Routine metadata access was denied.")
+        denied_policies = sum(p["row_access_policies_status"] not in ("harvested", "not_applicable") for p in policy_rows)
+        if denied_policies:
+            warnings.append(f"Row-access policy metadata was unavailable for {denied_policies} table(s).")
+        denied_samples = sum(p["preview_status"] not in ("harvested", "not_applicable") for p in sample_rows)
+        if denied_samples:
+            warnings.append(f"Row samples were unavailable for {denied_samples} table(s).")
+        progress.add()
+        try:
+            if dataset_resource.get("location"):
+                scopes = recommendations.refresh(c, ref.project, dataset_resource["location"])
+                warnings.extend(f"{s['kind'].title()}: {s['message']}" for s in scopes if s["status"] != "harvested")
+            else:
+                warnings.append("Recommendations were not collected because the dataset location is unknown.")
+        except Exception as error:
+            # The dataset has already been published; optional service/cache failures
+            # must not misreport it as a failed snapshot or discard useful metadata.
+            logging.warning("Recommendation refresh failed (%s)", type(error).__name__)
+            warnings.append("Recommendation refresh did not complete; any previous cached results are retained.")
+        finally:
+            progress.advance()
         extra = f", {len(routine_rows)} routines" if routines_status == "harvested" else ", routines denied"
-        progress.log(f"{ds}: {len(fetched)} tables, {len(col_rows)} column paths{extra} (snapshot {sid})")
+        progress.log(f"{ds}: {len(fetched)} tables, {len(col_rows)} column paths{extra}, {len(model_rows)} models (snapshot {sid})")
         with counts_lock:
             counts["datasets.get"] += 1
             counts["tables.get"] += len(fetched)
             counts["routines.get"] += len(routines)
+            counts["models.get"] += len(model_rows)
+            coverage[ds] = {"status": "partial" if warnings else "complete", "warnings": warnings}
 
     errors = []
     with ThreadPoolExecutor(min(DATASET_WORKERS, len(refs)) or 1) as pool:
@@ -245,9 +387,14 @@ def harvest(datasets: list[str], progress: Quiet | None = None) -> dict:
                 errors.append(error)
                 progress.log(f"{ds}: failed ({type(error).__name__}); its previous snapshot stays current")
     progress.close()
+    c.close()
     if errors:
         raise errors[0]
-    return free_api_receipt("datasets.get", "tables.list", "tables.get", "routines.list", "routines.get") | {"get_calls": counts}
+    receipt = free_api_receipt("datasets.get", "tables.list", "tables.get", "routines.list", "routines.get",
+                               "models.list", "models.get", "rowAccessPolicies.list", "recommendations.list", "insights.list",
+                               *(["tabledata.list"] if include_preview_rows else []))
+    receipt["source"] += " Recommender API reads are free (https://cloud.google.com/recommender/pricing); daily cached results may be reused."
+    return receipt | {"get_calls": counts, "coverage": coverage}
 
 
 def dry_run_receipt(job) -> dict:
@@ -419,7 +566,44 @@ def _json_value(value):
         return str(value)
     if isinstance(value, bytes):
         return base64.b64encode(value).decode("ascii")
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
     return value
+
+
+def table_sample(c, table):
+    out = {"preview_rows": None, "preview_status": "not_applicable", "preview_message": None, "preview_sampled_at": None}
+    if table.table_type not in ("TABLE", "SNAPSHOT"):
+        return out
+    try:
+        rows, size = [], 2
+        for row in c.list_rows(table, max_results=SAMPLE_ROWS, page_size=SAMPLE_ROWS, timeout=30, retry=None):
+            value = _json_value(dict(row.items()))
+            row_bytes = len(json.dumps(value).encode("utf-8")) + (2 if rows else 0)
+            if size + row_bytes > SAMPLE_BYTES:
+                out["preview_message"] = "Sample shortened to keep saved rows within 256 KB."
+                break
+            rows.append(value)
+            size += row_bytes
+        out.update(preview_rows=rows, preview_status="harvested", preview_sampled_at=dt.datetime.now(dt.UTC))
+    except OPTIONAL_ERRORS as error:
+        out["preview_status"], out["preview_message"] = metadata_failure(error)
+    return out
+
+
+def refresh_sample(fqn):
+    """Replace a saved sample only if its table snapshot is still current."""
+    with catalog.connect() as con:
+        sid = catalog.describe(con, fqn)["snapshot_id"]
+    c = client()
+    try:
+        sample = table_sample(c, c.get_table(fqn))
+    finally:
+        c.close()
+    if not catalog.save_sample(fqn, sid, sample):
+        raise SoundingError("The table was refreshed while loading its sample. Reload the table and try again.")
+    with catalog.connect() as con:
+        return catalog.describe(con, fqn) | {"receipt": free_api_receipt("tables.get", "tabledata.list")}
 
 
 def preview(fqn: str, n: int = 5) -> dict:
@@ -479,6 +663,79 @@ def cost_report(hours: int = 24) -> dict:
             "source": "BigQuery jobs.list (free) for jobs your identity ran in this project. Dry runs, "
                       "metadata calls and previews never create jobs, so they never appear. Jobs billed "
                       "to other projects are not shown; your billing report is the final word."}
+
+
+def table_queries(table: str, days: int = 30, *, project: str | None = None,
+                  scope: str = "user", rank_by: str = "billed_bytes", limit: int = 20) -> dict:
+    """Rank individual completed query jobs that report a reference to this table.
+
+    This is a bounded free jobs.list scan, not a query or a complete lineage log.
+    No SQL text or identities are returned or saved; inspect_query_job can reveal
+    SQL explicitly. Job totals are not attributed to the table's share of work.
+    """
+    text(table, "table")
+    try:
+        ref = bigquery.TableReference.from_string(table)
+    except ValueError as error:
+        raise SoundingError("Table must be project.dataset.table.") from error
+    table = str(ref)
+    integer(days, "days", 1, 180)
+    integer(limit, "limit", 1, 100)
+    if project is not None:
+        workload.identifier(project, "project")
+    if scope not in ("user", "project") or rank_by not in ("billed_bytes", "slot_ms"):
+        raise SoundingError("Choose user or project scope, and billed_bytes or slot_ms ranking.")
+    c = client()
+    project = project or c.project
+    now = dt.datetime.now(dt.UTC)
+    since = now - dt.timedelta(days=days)
+    jobs, unreachable = [], set()
+    try:
+        pages = c.list_jobs(project=project, all_users=scope == "project", state_filter="done",
+                            min_creation_time=since, max_creation_time=now,
+                            max_results=COST_REPORT_MAX_JOBS + 1, page_size=100, timeout=30).pages
+        for page in pages:
+            unreachable.update((page._raw_page or {}).get("unreachable", []))
+            jobs.extend(page)
+    finally:
+        c.close()
+    rows, missing_references, scripts = [], 0, 0
+    for job in jobs[:COST_REPORT_MAX_JOBS]:
+        props = job._properties
+        if job.job_type != "query" or (props.get("status") or {}).get("errorResult"):
+            continue
+        stats = props.get("statistics") or {}
+        query = stats.get("query") or {}
+        if query.get("statementType") == "SCRIPT":
+            scripts += 1
+            continue
+        refs = (query.get("referencedTables") or []) + (query.get("referencedLogicalViews") or [])
+        if not refs:
+            missing_references += 1
+        if table not in {_ref(r) for r in refs}:
+            continue
+        rows.append({"job_id": job.job_id, "project": job.project, "location": job.location,
+                     "created": _iso(job.created), "statement_type": query.get("statementType"),
+                     "billed_bytes": _int(query.get("totalBytesBilled")),
+                     "processed_bytes": _int(query.get("totalBytesProcessed")),
+                     "slot_ms": _int(query.get("totalSlotMs", stats.get("totalSlotMs"))),
+                     "cache_hit": query.get("cacheHit"), "referenced_tables": [_ref(r) for r in refs]})
+    rows.sort(key=lambda r: (r[rank_by] is not None, r[rank_by] or 0, r["created"] or ""), reverse=True)
+    truncated = len(jobs) > COST_REPORT_MAX_JOBS
+    warnings = ["Ranks individual executions by whole-job totals, not the portion attributable to this table.",
+                "Only top-level jobs with a reported table/view reference are matched. Script children and jobs in other projects are not searched; references can be incomplete."]
+    if truncated:
+        warnings.append(f"Only the newest {COST_REPORT_MAX_JOBS} completed jobs were scanned. Shorten the window; these are not necessarily the top jobs for the whole period.")
+    if missing_references:
+        warnings.append(f"{missing_references} query jobs had no visible table references and could not be matched (including possible cache hits or redacted metadata).")
+    if unreachable:
+        warnings.append("Google could not reach these locations: " + ", ".join(sorted(unreachable)))
+    return {"table": table, "project": project, "scope": scope, "days": days,
+            "since": since.isoformat(), "until": now.isoformat(), "rank_by": rank_by,
+            "jobs_scanned": min(len(jobs), COST_REPORT_MAX_JOBS), "matching_jobs": len(rows),
+            "jobs": rows[:limit], "truncated": truncated, "results_limited": len(rows) > limit,
+            "missing_references": missing_references, "scripts_excluded": scripts,
+            "warnings": warnings, "receipt": free_api_receipt("jobs.list")}
 
 
 def query_opportunities(location: str, *, project: str | None = None, hours: int = 168,

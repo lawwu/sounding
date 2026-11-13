@@ -206,3 +206,36 @@ def test_failed_migration_leaves_v2_catalog_intact(tmp_path, monkeypatch):
         with catalog.connect(path):
             pass
     assert _schema(path) == before
+
+
+def test_browse_groups_latest_snapshots_and_keeps_empty_datasets(seed):
+    seed([table_row('p.shared.old')], [], dataset='p.shared')
+    seed([], [], dataset='p.shared')
+    seed([table_row('other.shared.live', num_bytes=None)], [], dataset='other.shared')
+    seed([table_row('p.second.live')], [], dataset='p.second')
+    with catalog.connect() as con:
+        tree = catalog.browse(con)['projects']
+    assert [p['project'] for p in tree] == ['other', 'p']
+    assert tree[0]['datasets'][0]['dataset'] == 'other.shared'
+    assert tree[0]['datasets'][0]['bytes'] is None
+    assert tree[1]['tables'] == 1
+    empty = tree[1]['datasets'][1]
+    assert empty['dataset'] == 'p.shared' and empty['dataset_id'] == 'shared'
+    assert empty['tables'] == 0 and empty['harvested_at'].endswith('+00:00')
+    assert empty['location'] is None  # Older snapshots without dataset metadata work.
+
+
+def test_scoped_search_combines_exact_identity_text_and_pagination(seed):
+    for ds in ['p.d', 'p.d_extra', 'p2.d']:
+        seed([table_row(f'{ds}.a'), table_row(f'{ds}.b')], [], dataset=ds)
+    with catalog.connect() as con:
+        assert len(catalog.search(con, project='p')['items']) == 4
+        first = catalog.search(con, dataset='p.d', limit=1)
+        second = catalog.search(con, dataset='p.d', limit=1, offset=first['next_offset'])
+        assert [first['items'][0]['table'], second['items'][0]['table']] == ['p.d.a', 'p.d.b']
+        assert second['next_offset'] is None
+        assert [r['table'] for r in catalog.search(con, q='b', project='p', dataset='p.d')['items']] == ['p.d.b']
+        assert catalog.search(con, project='p2', dataset='p.d')['items'] == []
+        assert catalog.search(con, project="p' OR 1=1 --")['items'] == []
+        with pytest.raises(ValueError):
+            catalog.search(con, dataset=None)

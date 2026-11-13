@@ -1,0 +1,122 @@
+<div class="docs">
+  <h2 class="overview-title">Docs &amp; API</h2>
+  <p class="desc">One local catalog, available in the browser, terminal and agent tools.</p>
+  <div class="toolbar" aria-label="Documentation sections">
+    <button data-doc-section="overview">Overview</button><button data-doc-section="cli">CLI</button>
+    <button data-doc-section="mcp">MCP</button><button data-doc-section="http">HTTP API</button>
+  </div>
+  <section data-doc-content="overview">
+    <h3>Browse first</h3>
+    <p>Catalog pages read saved metadata. No Google credentials or Google calls are needed to browse projects, datasets, table schemas and saved estimates.</p>
+    <p>Enter a project ID under <b>Open a Google Cloud project</b> and choose <b>Open &amp; import</b>. Sounding starts importing its accessible datasets immediately, using existing credentials. Datasets appear as metadata is saved; progress stays visible while you browse.</p>
+    <p><b>Reload catalog</b> rereads the local file. <b>Refresh metadata</b> contacts BigQuery using existing Google credentials and saves new snapshots. A whole-project refresh discovers accessible, non-hidden datasets. Select several projects or datasets to refresh together; overlapping selections are deduplicated.</p>
+    <p>Each dataset is published atomically. A failure retains its previous snapshot while other datasets finish. Datasets no longer visible in a project are retained locally. Refresh status survives browser reloads, but is held in the server's memory and disappears when that server restarts. Completed snapshots remain on disk.</p>
+    <h3>Free metadata and explicit actions</h3>
+    <p>Metadata refresh, previews, job history and dry runs use free BigQuery API operations. Column-cost refresh runs one dry run per top-level column; user SQL never executes. Refreshing metadata does not recalculate saved column estimates.</p>
+    <p>Schema badges mark partition columns, clustering order, declared keys and policy tags. Declared primary and foreign keys are not enforced by BigQuery. Ingestion-time partitioning uses virtual columns. Range bounds, partition expiry, labels, storage, table expiry and lineage are shown when present in the snapshot.</p>
+    <h3>Models, policies and recommendations</h3>
+    <p>Dataset pages list BigQuery models; open one for its type, input features, targets and remote model settings. Table pages include row-access policy names and expandable filter expressions. Membership lists are not collected. No model training, inference or policy changes run.</p>
+    <p>Project, dataset and table pages show partition/cluster recommendations and table insights. These are fetched per project/location and cached for 24 hours, including failed attempts, to conserve API quota. Last-attempt and last-success timestamps identify stale results. Suggestions are never applied. A refresh with denied or unavailable optional metadata is marked partial while successful metadata is still saved.</p>
+    <p>Existing credentials need <code>bigquery.models.list</code> and <code>bigquery.models.getMetadata</code> for models, <code>bigquery.rowAccessPolicies.list</code> for policies, and the BigQuery Recommender viewer permissions (such as <code>roles/recommender.bigqueryPartitionClusterViewer</code>) for recommendations and insights. Disabled APIs, missing permission and quota limits appear explicitly; Sounding does not enable services.</p>
+    <h3>Optional row samples</h3>
+    <p>Imports are metadata-only by default. <b>Load 10 rows</b> on a table explicitly fetches and saves a small sample using free <code>tabledata.list</code>. The CLI flag <code>--include-preview-rows</code> includes samples during harvest or refresh and prints a warning: <b>this can add a material delay</b>. It requires permission to read the actual data.</p>
+    <p>Samples have arbitrary order, a timestamp, and a limit of 10 rows / 256 KiB of saved JSON per native table or snapshot. This storage limit does not bound the API response size. Views and external tables are not queried. A normal metadata-only refresh does not carry samples into the new snapshot; older snapshots can still contain previously saved data.</p>
+    <h3>Table query history</h3>
+    <p>Choose 1–180 days (default 30), the job project and visibility, then load the top individual query jobs by billed bytes or slot time. The job project can differ from the table's project. “My jobs” is the current identity; project-wide metadata may require <code>bigquery.jobs.listAll</code>.</p>
+    <p>The free lookup scans at most the newest 1,000 completed top-level jobs. It matches reported table or logical-view references; scripts' children, missing references and other job projects are not included. Warnings identify truncation or unreachable locations. An empty result does not establish no usage. Metrics are whole-job totals, not a table's allocated share. SQL appears only when you choose “Show SQL &amp; details” and is not saved.</p>
+    <p>Workload opportunity scans are separate: their default is a free preview; executing a billed scan requires explicit opt-in and a byte cap. See the CLI and MCP references.</p>
+    <h3>Local files</h3>
+    <p>The catalog defaults to <code>~/.sounding/catalog.duckdb</code>. <code>SOUNDING_CATALOG</code> selects another local file. <code>SOUNDING_JOB_PROJECT</code> selects the default project for dry runs and job history. Live actions use Application Default Credentials already configured on this computer. This UI does not sign you in.</p>
+  </section>
+  <section data-doc-content="cli" hidden>
+    <h3>Command line</h3>
+    <p>From the Sounding checkout, prefix commands with <code>uv run</code>. Run <code>sounding --help</code> or <code>sounding COMMAND --help</code> for all options.</p>
+    <pre>sounding ui --open
+sounding browse
+sounding show orders --project my-project
+sounding show id --dataset my-project.analytics
+sounding describe my-project.analytics.orders
+sounding dataset my-project.analytics</pre>
+    <pre>sounding model my-project.analytics.revenue_model
+sounding recommendations my-project</pre>
+    <h3>Refresh with progress</h3>
+    <pre># Selected datasets
+sounding refresh my-project.analytics other-project.sales
+
+# Whole projects, including newly visible datasets
+sounding refresh --project my-project --project other-project
+
+# Harvest also accepts whole projects (same discovery and progress)
+sounding harvest --project my-project --project other-project
+
+# Original dataset harvester
+sounding harvest my-project.analytics</pre>
+    <pre># Optional actual row data; WARNING: can add a material delay
+sounding harvest my-project.analytics --include-preview-rows
+sounding refresh --project my-project --include-preview-rows</pre>
+    <p>Refresh and project-level harvest print the final result as JSON to stdout and progress to stderr. Partial or failed imports exit with code 2. One refresh per catalog can run at a time; reads remain available. Repeat <code>--project</code> to include several projects; explicitly named datasets are combined with discovered datasets without duplicates.</p>
+    <h3>Inspect cost and usage</h3>
+    <pre>sounding column-costs my-project.analytics.orders
+sounding estimate 'SELECT order_id FROM `my-project.analytics.orders`'
+sounding preview my-project.analytics.orders
+sounding cost-report --hours 720
+sounding table-queries my-project.analytics.orders --days 30
+sounding table-queries my-project.analytics.orders --project job-project --scope project --rank-by slot_ms
+sounding inspect-job JOB_ID --project job-project --location US --include-sql</pre>
+    <h3>Workload investigations</h3>
+    <pre># Free preview of the capped monitoring scan
+sounding query-opportunities --location US --hours 720
+
+# Execute only when a billed scan is intended
+sounding query-opportunities --location US --hours 720 --allow-billed
+sounding query-report</pre>
+    <p>The scan defaults to a 100 MiB byte cap; <code>--max-bytes-billed</code> changes it within the supported bounds. It does not cap capacity/slot charges. Routine commands: <code>routines [text]</code> and <code>routine project.dataset.routine</code>.</p>
+  </section>
+  <section data-doc-content="mcp" hidden>
+    <h3>Connect an agent</h3>
+    <p>Sounding exposes a stdio MCP server. Replace the directory below with your checkout's absolute path in your MCP client's configuration.</p>
+    <pre>{
+  "mcpServers": {
+    "sounding": {
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/sounding", "sounding", "mcp"]
+    }
+  }
+}</pre>
+    <div class="scroll"><table><thead><tr><th>Tools</th><th>Behavior</th></tr></thead><tbody>
+      <tr><td><code>browse_catalog</code>, <code>search_catalog</code>, <code>describe_table</code>, <code>describe_dataset</code></td><td>Local project/dataset hierarchy, scoped search and metadata. Search accepts project/dataset filters and returns items + next_offset.</td></tr>
+      <tr><td><code>search_routines</code>, <code>describe_routine</code></td><td>Local functions, procedures, signatures and definitions.</td></tr>
+      <tr><td><code>describe_model</code>, <code>project_recommendations</code></td><td>Local model metadata and cached recommendations/insights with coverage.</td></tr>
+      <tr><td><code>refresh_metadata</code>, <code>refresh_status</code></td><td>Start a background refresh with datasets and/or projects, then poll on the same MCP server. Free metadata calls.</td></tr>
+      <tr><td><code>preview_rows</code>, <code>estimate_query_cost</code></td><td>Free previews and dry runs with receipts; unknown estimates remain unknown.</td></tr>
+      <tr><td><code>cost_report</code>, <code>table_query_history</code>, <code>inspect_query_job</code></td><td>Free job metadata. Table history defaults to 30 days; SQL inspection requires include_sql=true.</td></tr>
+      <tr><td><code>query_opportunities</code></td><td>Free preview by default. allow_billed=true requires authorization for one capped metadata scan.</td></tr>
+      <tr><td><code>query_opportunity_report</code></td><td>Read a saved workload report without calling Google.</td></tr>
+    </tbody></table></div>
+    <pre>refresh_metadata(projects=["my-project", "other-project"])
+refresh_status()
+search_catalog(q="order", dataset="my-project.analytics")
+table_query_history(table="my-project.analytics.orders", days=30)</pre>
+  </section>
+  <section data-doc-content="http" hidden>
+    <h3>Local UI API</h3>
+    <p>The browser uses these same-origin endpoints. They are internal to the UI; use CLI or MCP for the supported integration interface. Every API request requires the current server's <code>X-Sounding-Token</code> header, supplied by the page's <code>sounding-token</code> meta element.</p>
+    <p>POST requests also require a same-origin <code>Origin</code> header and <code>Content-Type: application/json</code>. The server listens only on loopback, validates Host and Origin, rejects cross-site requests, and does not enable CORS.</p>
+    <div class="scroll"><table><thead><tr><th>Endpoint</th><th>Input / result</th></tr></thead><tbody>
+      <tr><td>GET <code>/api/browse</code></td><td>Saved projects and datasets.</td></tr>
+      <tr><td>GET <code>/api/search</code></td><td>q, project, dataset, offset; returns items and next_offset.</td></tr>
+      <tr><td>GET <code>/api/table</code>, <code>/api/dataset</code></td><td>fqn or dataset query parameter.</td></tr>
+      <tr><td>GET <code>/api/model</code>, <code>/api/recommendations</code></td><td>fqn or project query parameter; saved data only.</td></tr>
+      <tr><td>GET <code>/api/stats</code>, <code>/api/docs</code></td><td>Local catalog totals or this documentation.</td></tr>
+      <tr><td>POST <code>/api/refresh</code></td><td>datasets and/or projects arrays; 202 with background job status.</td></tr>
+      <tr><td>GET <code>/api/refresh</code></td><td>Latest refresh state and progress for this UI server.</td></tr>
+      <tr><td>POST <code>/api/table-queries</code></td><td>table, days (30), project (optional), scope (user), rank_by (billed_bytes), limit (20).</td></tr>
+      <tr><td>POST <code>/api/inspect-job</code></td><td>job_id, location, project (optional), include_sql (false).</td></tr>
+      <tr><td>POST <code>/api/cost-report</code></td><td>hours (24).</td></tr>
+      <tr><td>POST <code>/api/column-costs</code>, <code>/api/preview</code></td><td>fqn.</td></tr>
+      <tr><td>POST <code>/api/refresh-sample</code></td><td>fqn; explicitly fetch and save up to 10 rows / 256 KiB, returning updated table metadata.</td></tr>
+      <tr><td>POST <code>/api/estimate</code></td><td>sql; dry run only.</td></tr>
+    </tbody></table></div>
+    <p>Refresh status is idle, pending, running, complete, partial or failed. Per-dataset outcomes and sanitized messages explain failures. Progress totals grow as metadata is discovered. A new server does not resume interrupted work.</p>
+  </section>
+</div>

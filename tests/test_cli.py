@@ -80,3 +80,46 @@ def test_query_report_cli_is_local(monkeypatch, capsys):
     saved = catalog.save_workload_report({"status": "complete", "project": "p"})
     code, out = run(monkeypatch, capsys, "query-report", saved["report_id"])
     assert code == 0 and json.loads(out.out) == saved
+
+
+def test_refresh_cli_partial_results_and_table_history(monkeypatch, capsys):
+    from google.api_core.exceptions import Forbidden
+    monkeypatch.setattr(bq, 'project_datasets', lambda p: {'datasets':[p+'.d'], 'unreachable':[], 'receipt':{}})
+    monkeypatch.setattr(bq, 'harvest', lambda *args: (_ for _ in ()).throw(Forbidden('denied')))
+    code, output = run(monkeypatch, capsys, 'refresh', '--project', 'p')
+    assert code == 2
+    assert json.loads(output.out)['datasets'][0]['status'] == 'failed'
+    seen = []
+    monkeypatch.setattr(bq, 'table_queries', lambda table,days,**kwargs: seen.append((table,days,kwargs)) or {'jobs':[]})
+    code, output = run(monkeypatch, capsys, 'table-queries', 'p.d.t', '--scope', 'project')
+    assert code == 0 and seen[0][1] == 30 and seen[0][2]['scope'] == 'project'
+
+
+@pytest.mark.parametrize("command", ["harvest", "refresh"])
+@pytest.mark.parametrize("include", [False, True])
+def test_preview_rows_flag_is_explicit_and_warns(monkeypatch, capsys, command, include):
+    seen = []
+    monkeypatch.setattr(bq, "harvest", lambda datasets, progress, **kwargs: seen.append(kwargs) or bq.free_api_receipt("tables.get"))
+    args = [command, "p.d"] + (["--include-preview-rows"] if include else [])
+    code, output = run(monkeypatch, capsys, *args)
+    assert code == 0
+    assert seen == ([{"include_preview_rows": True}] if include else [{}])
+    assert ("material delay" in output.err) is include
+
+
+@pytest.mark.parametrize("include", [False, True])
+def test_harvest_project_flag_discovers_multiple_projects_and_deduplicates(monkeypatch, capsys, include):
+    seen = []
+    monkeypatch.setattr(bq, "project_datasets", lambda p: {"datasets":[p + ".d"], "unreachable":[], "receipt":{}})
+    monkeypatch.setattr(bq, "harvest", lambda datasets, progress, **kwargs: seen.append((datasets, kwargs)) or bq.free_api_receipt("tables.get"))
+    args = ["harvest", "p.d", "--project", "p", "--project", "q"] + (["--include-preview-rows"] if include else [])
+    code, output = run(monkeypatch, capsys, *args)
+    assert code == 0 and json.loads(output.out)["status"] == "complete"
+    assert sorted(ds[0] for ds, _ in seen) == ["p.d", "q.d"]
+    assert all(kwargs == ({"include_preview_rows": True} if include else {}) for _, kwargs in seen)
+    assert ("material delay" in output.err) is include
+
+
+def test_harvest_requires_a_dataset_or_project(monkeypatch, capsys):
+    code, output = run(monkeypatch, capsys, "harvest")
+    assert code == 2 and "dataset or --project" in output.err

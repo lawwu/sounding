@@ -46,6 +46,10 @@ def fake_client(monkeypatch, tables=None, routines=(), dataset=None):
     client.get_table.side_effect = lambda ref: ref
     client.list_routines.return_value = [NS(reference=r) for r in routines]
     client.get_routine.side_effect = lambda ref: ref
+    client.list_models.return_value = []
+    client._call_api.return_value = {}
+    client.list_rows.return_value = []
+    client._http.get.return_value = Mock(status_code=200, json=lambda: {})
     monkeypatch.setattr(bq, "client", lambda: client)
     return client
 
@@ -353,7 +357,7 @@ def test_table_resource_fields_are_captured(monkeypatch):
     assert any("must filter on the partition column" in n for n in t["notes"])
     assert any("policy tags" in n and "email" in n for n in t["notes"])
     assert any("not enforced" in n for n in t["notes"])
-    assert "resource" not in t and "schema" not in resource and resource["numPartitions"] == "32"
+    assert "resource" not in t and resource["schema"]["fields"] == schema and resource["numPartitions"] == "32"
     # Absent fields are unknown (None), never zero or False.
     assert plain["storage"] is None and plain["num_partitions"] is None
     assert plain["require_partition_filter"] is None and plain["primary_key"] is None and plain["notes"] == []
@@ -365,6 +369,25 @@ def test_partitioned_table_without_flag_does_not_require_filter(monkeypatch):
     with catalog.connect() as con:
         t = catalog.describe(con, "p.d.t")
     assert t["partitioning"] == "DAY:_PARTITIONTIME" and t["require_partition_filter"] is False
+    assert t["partition"]["ingestion_time"] is True
+    assert not any(c["partition_column"] for c in t["columns"])
+
+
+def test_column_roles_and_range_bounds_come_from_saved_metadata(monkeypatch):
+    fake_client(monkeypatch, [remote_table(schema=[field('id','INT64', defaultValueExpression='42'),field('email', maxLength='100',collation='und:ci')],
+        rangePartitioning={'field':'id','range':{'start':'0','end':'100','interval':'10'}},
+        clustering={'fields':['email','id']}, tableConstraints={'primaryKey':{'columns':['id']}})])
+    bq.harvest(['d'])
+    with catalog.connect() as con:
+        table = catalog.describe(con, 'p.d.t')
+    assert table['partition'] == {'kind':'RANGE','field':'id','ingestion_time':False,
+                                  'range':{'start':'0','end':'100','interval':'10'}}
+    id_column, email = table['columns']
+    assert id_column['partition_column'] and id_column['primary_key']
+    assert id_column['clustering_order'] == 2 and email['clustering_order'] == 1
+    assert not email['partition_column'] and not email['primary_key']
+    assert id_column['metadata'] == {'defaultValueExpression':'42'}
+    assert email['metadata'] == {'maxLength':'100','collation':'und:ci'}
 
 
 def test_views_materialized_views_and_external_tables(monkeypatch):
@@ -440,7 +463,7 @@ def test_harvest_returns_a_receipt_of_free_calls(monkeypatch):
     fake_client(monkeypatch, [remote_table("a"), remote_table("b")], [remote_routine()])
     receipt = bq.harvest(["p.d"])
     assert receipt["jobs_created"] == 0 and receipt["free"] is True
-    assert receipt["get_calls"] == {"datasets.get": 1, "tables.get": 2, "routines.get": 1}
+    assert receipt["get_calls"] == {"datasets.get": 1, "tables.get": 2, "routines.get": 1, "models.get": 0}
 
 
 def test_column_cost_dry_runs_run_concurrently_in_column_order(seed, monkeypatch):
@@ -478,8 +501,8 @@ def test_datasets_are_harvested_concurrently_with_progress(monkeypatch):
     c.get_dataset.side_effect = lambda ref: both_running.wait() and dataset or dataset
     progress = Recorder()
     receipt = bq.harvest(["p.one", "p.two"], progress)
-    assert receipt["get_calls"] == {"datasets.get": 2, "tables.get": 4, "routines.get": 2}
-    assert progress.total == progress.done == 2 + 4 + 2  # one unit per dataset, table and routine
+    assert receipt["get_calls"] == {"datasets.get": 2, "tables.get": 4, "routines.get": 2, "models.get": 0}
+    assert progress.total == progress.done == 2 + 4 + 2 + 4 + 2  # datasets, tables, routines, policies, regional cache
     assert sorted(line.split(":")[0] for line in progress.lines) == ["p.one", "p.two"]
     with catalog.connect() as con:
         assert catalog.stats(con)["datasets"] == 2

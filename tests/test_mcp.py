@@ -71,3 +71,21 @@ def test_missing_table_is_protocol_error_over_stdio():
                 result=await session.call_tool("search_catalog",{})
                 assert not result.is_error
     asyncio.run(check())
+
+
+def test_browse_refresh_and_history_tools(monkeypatch, seed):
+    from sounding import refresh
+    seed()
+    started = []
+    monkeypatch.setattr(refresh.Manager, 'start', lambda self,datasets,projects: started.append((datasets,projects)) or {'status':'running'})
+    async def check():
+        app = create_server()
+        schemas = {t.name:t.input_schema for t in await app.list_tools()}
+        assert schemas['table_query_history']['properties']['days']['default'] == 30
+        assert schemas['refresh_metadata']['properties']['projects']['anyOf'][0]['maxItems'] == 25
+        assert 'p.d' in str(await app.call_tool('browse_catalog', {}))
+        await app.call_tool('refresh_metadata', {'projects':['p','q']})
+        assert 'idle' in str(await app.call_tool('refresh_status', {}))
+        assert 'p.d.t' in str(await app.call_tool('search_catalog', {'dataset':'p.d'}))
+    asyncio.run(check())
+    assert started == [(None,['p','q'])]

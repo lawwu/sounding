@@ -22,7 +22,7 @@ from .errors import CatalogBusy, CatalogVersionError, MissingTable, integer, tex
 
 CATALOG = Path(os.environ.get("SOUNDING_CATALOG", Path.home() / ".sounding" / "catalog.duckdb"))
 LOCK_TIMEOUT = 10
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 USD_PER_TIB = 6.25  # US on-demand list price; excludes discounts and the monthly free tier.
 TIB = 1024**4
 MIB = 1024**2
@@ -83,8 +83,32 @@ CREATE TABLE workload_reports (
   report_id VARCHAR PRIMARY KEY, saved_at TIMESTAMPTZ NOT NULL, report JSON NOT NULL);
 UPDATE catalog_meta SET version = 4;
 """,
+    4: """
+ALTER TABLE datasets ADD COLUMN models_status VARCHAR;
+ALTER TABLE datasets ADD COLUMN models_message VARCHAR;
+ALTER TABLE tables ADD COLUMN row_access_policies JSON;
+ALTER TABLE tables ADD COLUMN row_access_policies_status VARCHAR;
+ALTER TABLE tables ADD COLUMN row_access_policies_message VARCHAR;
+ALTER TABLE tables ADD COLUMN preview_rows JSON;
+ALTER TABLE tables ADD COLUMN preview_status VARCHAR;
+ALTER TABLE tables ADD COLUMN preview_message VARCHAR;
+ALTER TABLE tables ADD COLUMN preview_sampled_at TIMESTAMPTZ;
+CREATE TABLE models (
+  snapshot_id BIGINT, dataset VARCHAR, model_id VARCHAR, fqn VARCHAR, type VARCHAR,
+  friendly_name VARCHAR, description VARCHAR, labels JSON, location VARCHAR,
+  created TIMESTAMPTZ, modified TIMESTAMPTZ, expires TIMESTAMPTZ,
+  feature_columns JSON, label_columns JSON, remote_info JSON, metadata_status VARCHAR,
+  metadata_message VARCHAR, PRIMARY KEY (snapshot_id, fqn));
+CREATE TABLE recommendation_cache (
+  project VARCHAR, location VARCHAR, kind VARCHAR, checked_at TIMESTAMPTZ,
+  fetched_at TIMESTAMPTZ, status VARCHAR, message VARCHAR, items JSON,
+  PRIMARY KEY (project, location, kind));
+CREATE TABLE projects (project VARCHAR PRIMARY KEY, imported_at TIMESTAMPTZ);
+UPDATE catalog_meta SET version = 5;
+""",
 }
-JSON_FIELDS = {"labels", "foreign_keys", "storage", "external", "materialized_view", "resource", "arguments"}
+JSON_FIELDS = {"labels", "foreign_keys", "storage", "external", "materialized_view", "resource", "arguments",
+               "row_access_policies", "feature_columns", "label_columns", "remote_info", "items", "preview_rows"}
 
 LATEST = """WITH latest AS (
     SELECT dataset, max(snapshot_id) AS snapshot_id FROM snapshots GROUP BY dataset
@@ -106,6 +130,10 @@ TABLE_SCHEMA = pa.schema([
     ("storage", pa.string()), ("kms_key", pa.string()), ("base_table", pa.string()),
     ("base_kind", pa.string()), ("external", pa.string()), ("materialized_view", pa.string()),
     ("resource", pa.string()),
+    ("row_access_policies", pa.string()), ("row_access_policies_status", pa.string()),
+    ("row_access_policies_message", pa.string()),
+    ("preview_rows", pa.string()), ("preview_status", pa.string()), ("preview_message", pa.string()),
+    ("preview_sampled_at", _TS),
 ])
 COLUMN_SCHEMA = pa.schema([
     ("snapshot_id", pa.int64()), ("fqn", pa.string()), ("path", pa.string()),
@@ -118,12 +146,21 @@ DATASET_SCHEMA = pa.schema([
     ("created", _TS), ("modified", _TS), ("default_table_expiration_ms", pa.int64()),
     ("default_partition_expiration_ms", pa.int64()), ("storage_billing_model", pa.string()),
     ("max_time_travel_hours", pa.int64()), ("routines_status", pa.string()), ("resource", pa.string()),
+    ("models_status", pa.string()), ("models_message", pa.string()),
 ])
 ROUTINE_SCHEMA = pa.schema([
     ("snapshot_id", pa.int64()), ("dataset", pa.string()), ("routine_id", pa.string()),
     ("fqn", pa.string()), ("type", pa.string()), ("language", pa.string()),
     ("arguments", pa.string()), ("return_type", pa.string()), ("description", pa.string()),
     ("definition", pa.string()), ("created", _TS), ("modified", _TS), ("resource", pa.string()),
+])
+MODEL_SCHEMA = pa.schema([
+    ("snapshot_id", pa.int64()), ("dataset", pa.string()), ("model_id", pa.string()),
+    ("fqn", pa.string()), ("type", pa.string()), ("friendly_name", pa.string()),
+    ("description", pa.string()), ("labels", pa.string()), ("location", pa.string()),
+    ("created", _TS), ("modified", _TS), ("expires", _TS),
+    ("feature_columns", pa.string()), ("label_columns", pa.string()), ("remote_info", pa.string()),
+    ("metadata_status", pa.string()), ("metadata_message", pa.string()),
 ])
 
 
@@ -222,11 +259,13 @@ def connect(path: Path | str | None = None, *, write: bool = False):
 
 
 def save_snapshot(dataset: str, table_rows: list[dict], col_rows: list[dict],
-                  dataset_row: dict | None = None, routine_rows: list[dict] = ()) -> int:
+                  dataset_row: dict | None = None, routine_rows: list[dict] = (),
+                  model_rows: list[dict] = ()) -> int:
     """Publish one complete dataset atomically. Failed inserts leave the previous snapshot current."""
     batches = [("tables", table_rows, TABLE_SCHEMA), ("columns", col_rows, COLUMN_SCHEMA),
                ("datasets", [dataset_row] if dataset_row else [], DATASET_SCHEMA),
-               ("routines", list(routine_rows), ROUTINE_SCHEMA)]
+               ("routines", list(routine_rows), ROUTINE_SCHEMA),
+               ("models", list(model_rows), MODEL_SCHEMA)]
     with connect(write=True) as con:
         con.execute("BEGIN")
         try:
@@ -249,6 +288,18 @@ def save_snapshot(dataset: str, table_rows: list[dict], col_rows: list[dict],
 def _encode(row: dict) -> dict:
     return {k: json.dumps(v, sort_keys=True) if k in JSON_FIELDS and v is not None else v
             for k, v in row.items()}
+
+
+def save_sample(fqn, snapshot_id, sample):
+    """Attach data to its metadata snapshot; a slower import cannot alter a newer one."""
+    with connect(write=True) as con:
+        row = con.execute(LATEST + " SELECT snapshot_id FROM current_tables WHERE fqn=?", [fqn]).fetchone()
+        if not row or row[0] != snapshot_id:
+            return False
+        con.execute("UPDATE tables SET preview_rows=?, preview_status=?, preview_message=?, preview_sampled_at=? WHERE snapshot_id=? AND fqn=?",
+                    [json.dumps(sample["preview_rows"]) if sample["preview_rows"] is not None else None,
+                     sample["preview_status"], sample["preview_message"], sample["preview_sampled_at"], snapshot_id, fqn])
+        return True
 
 
 def save_workload_report(report: dict) -> dict:
@@ -307,11 +358,14 @@ def _iso(value):
     return value
 
 
-def search(con, q: str = "", limit: int = 50, offset: int = 0) -> dict:
+def search(con, q: str = "", limit: int = 50, offset: int = 0, *,
+           project: str = "", dataset: str = "") -> dict:
     """A bounded page of literal substring matches and a bounded sample of matching paths."""
     q = text(q, "q", empty=True).strip()
     integer(limit, "limit", 1, SEARCH_LIMIT)
     integer(offset, "offset", 0, 1_000_000)
+    text(project, "project", empty=True)
+    text(dataset, "dataset", empty=True)
     # contains() treats %, _, and backslashes literally; parameters protect SQL syntax.
     rows = con.execute(LATEST + """, matched AS (
         SELECT c.snapshot_id, c.fqn, c.path,
@@ -326,17 +380,51 @@ def search(con, q: str = "", limit: int = 50, offset: int = 0) -> dict:
     SELECT t.fqn, t.type, t.num_rows, t.num_bytes, t.modified,
            substr(t.description, 1, 1000), m.paths, coalesce(m.total, 0)
     FROM current_tables t LEFT JOIN matches m USING (snapshot_id, fqn)
-    WHERE $q = '' OR contains(lower(t.fqn), lower($q))
-        OR contains(lower(t.description), lower($q)) OR m.total > 0
+    WHERE ($q = '' OR contains(lower(t.fqn), lower($q))
+        OR contains(lower(t.description), lower($q)) OR m.total > 0)
+      AND ($project = '' OR regexp_replace(t.dataset, '[.][^.]+$', '') = $project)
+      AND ($dataset = '' OR t.dataset = $dataset)
     ORDER BY t.num_bytes DESC NULLS LAST, t.fqn
     LIMIT $limit OFFSET $offset
-    """, {"q": q, "match_limit": MATCH_LIMIT, "limit": limit + 1, "offset": offset}).fetchall()
+    """, {"q": q, "match_limit": MATCH_LIMIT, "limit": limit + 1, "offset": offset,
+          "project": project, "dataset": dataset}).fetchall()
     return {"items": [
         {"table": r[0], "type": r[1], "rows": r[2], "bytes": r[3],
          "full_scan_usd": full_scan_usd(r[1], r[3]), "modified": _iso(r[4]), "description": r[5],
          "matched_columns": r[6] or [], "matched_column_count": r[7], "source": "catalog (free)"}
         for r in rows[:limit]],
         "next_offset": offset + limit if len(rows) > limit else None}
+
+
+def browse(con) -> dict:
+    """Project → dataset hierarchy from current snapshots, including empty datasets.
+
+    Dataset identity is stored as project.dataset throughout the catalog. Group
+    on that identity, not table presence or text-search matches, so two projects
+    can have identically named datasets and deleted tables cannot revive old ones.
+    """
+    rows = con.execute(LATEST + """
+        SELECT l.dataset, s.taken_at, d.location, d.description,
+               count(t.fqn), sum(t.num_bytes), count(*) FILTER (WHERE t.fqn IS NOT NULL AND t.num_bytes IS NULL),
+               (SELECT count(*) FROM routines r WHERE r.snapshot_id = l.snapshot_id),
+               (SELECT count(*) FROM models m WHERE m.snapshot_id = l.snapshot_id)
+        FROM latest l JOIN snapshots s USING (dataset, snapshot_id)
+        LEFT JOIN datasets d USING (dataset, snapshot_id)
+        LEFT JOIN current_tables t USING (dataset, snapshot_id)
+        GROUP BY l.dataset, l.snapshot_id, s.taken_at, d.location, d.description ORDER BY l.dataset
+    """).fetchall()
+    projects = {r[0]: {"project": r[0], "datasets": [], "tables": 0, "routines": 0, "models": 0}
+                for r in con.execute("SELECT project FROM projects ORDER BY project").fetchall()}
+    for r in rows:
+        project, dataset_id = r[0].rsplit(".", 1)
+        node = projects.setdefault(project, {"project": project, "datasets": [], "tables": 0, "routines": 0, "models": 0})
+        node["datasets"].append({"dataset": r[0], "dataset_id": dataset_id, "harvested_at": _iso(r[1]),
+                                 "location": r[2], "description": r[3], "tables": r[4],
+                                 "bytes": r[5] if not r[6] else None, "routines": r[7], "models": r[8]})
+        node["tables"] += r[4]
+        node["routines"] += r[7]
+        node["models"] += r[8]
+    return {"projects": [projects[key] for key in sorted(projects)]}
 
 
 def stats(con) -> dict:
@@ -371,18 +459,40 @@ def _notes(t: dict, columns: list[dict]) -> list[str]:
 
 def describe(con, fqn: str) -> dict:
     text(fqn, "table")
-    cur = con.execute(LATEST + " SELECT * EXCLUDE (resource) FROM current_tables WHERE fqn = ?", [fqn])
+    cur = con.execute(LATEST + " SELECT * FROM current_tables WHERE fqn = ?", [fqn])
     row = cur.fetchone()
     if row is None:
         raise MissingTable("Table is not in the latest catalog snapshot; harvest its dataset first.")
     out = {k: _decode(k, v) for k, v in zip([d[0] for d in cur.description], row)}
+    resource = out.pop("resource", None) or {}
+    kind, _, field = (out["partitioning"] or "").partition(":")
+    out["partition"] = ({"kind": kind, "field": field, "ingestion_time": field == "_PARTITIONTIME",
+                         "range": (resource.get("rangePartitioning") or {}).get("range")}
+                        if kind else None)
     names = ["path", "type", "mode", "description", "scan_bytes", "policy_tags"]
     cols = con.execute(
         f"SELECT {', '.join(names)} FROM columns WHERE snapshot_id = ? AND fqn = ? ORDER BY rowid",
         [out["snapshot_id"], fqn]).fetchall()
     out["columns"] = [dict(zip(names, c)) for c in cols]
+    schema_fields = {}
+    def collect_fields(fields, prefix=""):
+        for field in fields:
+            path = prefix + field["name"]
+            schema_fields[path] = {k: v for k, v in field.items()
+                                   if k not in {"name", "type", "mode", "description", "policyTags", "fields"}}
+            collect_fields(field.get("fields", []), path + ".")
+    collect_fields((resource.get("schema") or {}).get("fields", []))
+    clusters = (out["clustering"] or "").split(",")
+    for column in out["columns"]:
+        path = column["path"]
+        column["partition_column"] = path == field
+        column["clustering_order"] = clusters.index(path) + 1 if path in clusters else None
+        column["primary_key"] = path in (out.get("primary_key") or [])
+        column["foreign_key"] = any(path == pair[0] for key in out.get("foreign_keys") or [] for pair in key["columns"])
+        column["metadata"] = schema_fields.get(path)  # None for snapshots predating full schema retention.
     out["full_scan_usd"] = full_scan_usd(out["type"], out["num_bytes"])
     out["notes"] = _notes(out, out["columns"])
+    out["recommendations"] = recommendations(con, out["dataset"].rsplit(".", 1)[0], table=fqn)
     out["source"] = "catalog (tables.get, free)"
     return out
 
@@ -401,8 +511,43 @@ def describe_dataset(con, dataset: str) -> dict:
     out["tables"] = con.execute("SELECT count(*) FROM tables WHERE snapshot_id = ?", [snap[0]]).fetchone()[0]
     out["routines"] = [_routine(r, definition_chars=0) for r in con.execute(
         f"SELECT {ROUTINE_COLUMNS} FROM routines WHERE snapshot_id = ? ORDER BY routine_id", [snap[0]]).fetchall()]
+    cur = con.execute("SELECT * EXCLUDE (snapshot_id) FROM models WHERE snapshot_id = ? ORDER BY model_id", [snap[0]])
+    out["models"] = [{k: _decode(k, v) for k, v in zip([d[0] for d in cur.description], row)} for row in cur.fetchall()]
+    out["recommendations"] = recommendations(con, dataset.rsplit(".", 1)[0], dataset=dataset)
     out["source"] = "catalog (datasets.get and routines.get, free)"
     return out
+
+
+def describe_model(con, fqn: str) -> dict:
+    text(fqn, "model")
+    cur = con.execute(LATEST + " SELECT m.* FROM models m JOIN latest USING (dataset, snapshot_id) WHERE fqn = ?", [fqn])
+    row = cur.fetchone()
+    if row is None:
+        raise MissingTable("Model is not in the latest catalog snapshot; refresh its dataset first.")
+    return {k: _decode(k, v) for k, v in zip([d[0] for d in cur.description], row)}
+
+
+def recommendations(con, project: str, *, dataset: str = "", table: str = "") -> dict:
+    """Read cached regional results only. Unknown or failed coverage is never an empty success."""
+    text(project, "project")
+    scope_dataset = dataset or (table.rsplit(".", 1)[0] if table else "")
+    location = None
+    if scope_dataset:
+        row = con.execute(LATEST + " SELECT d.location FROM datasets d JOIN latest USING (dataset, snapshot_id) WHERE dataset=?", [scope_dataset]).fetchone()
+        location = row[0].lower() if row and row[0] else None
+    cur = con.execute("SELECT * FROM recommendation_cache WHERE project = ? ORDER BY location, kind", [project])
+    scopes = []
+    for row in cur.fetchall():
+        entry = {k: _decode(k, v) for k, v in zip([d[0] for d in cur.description], row)}
+        if location and entry["location"] != location:
+            continue
+        fetched = dt.datetime.fromisoformat(entry["fetched_at"]) if entry["fetched_at"] else None
+        entry["stale"] = entry["status"] != "harvested" or fetched is None or dt.datetime.now(dt.UTC) - fetched > dt.timedelta(hours=24)
+        items = entry["items"] or []
+        entry["items"] = [item for item in items if (not table or table in item["tables"])
+                          and (not dataset or any(t.rsplit(".", 1)[0] == dataset for t in item["tables"]))]
+        scopes.append(entry)
+    return {"project": project, "scopes": scopes, "source": "local cache", "cache_hours": 24}
 
 
 ROUTINE_COLUMNS = "fqn, type, language, arguments, return_type, substr(description, 1, 1000), definition"

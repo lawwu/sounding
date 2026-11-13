@@ -18,6 +18,9 @@ Sounding answers each question from the cheapest source that can.
 | REST `tables.list` / `tables.get` | Schema (nested), descriptions, row and byte counts, last modified, partitioning, clustering, view SQL, plus everything else in the [table resource](https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/tables) (see below) | $0 (API quota) |
 | REST `datasets.get` | Location, description, labels, default expirations, storage billing model, time-travel window | $0 (API quota) |
 | REST `routines.list` / `routines.get` | Functions and procedures: type, language, signature, return type, description, body | $0 (API quota) |
+| REST `models.list` / `models.get` | Model type, features, labels, timestamps and remote model settings | $0 (API quota) |
+| REST `rowAccessPolicies.list` | Policy names and filter predicates, without IAM membership lists | $0 (API quota) |
+| Recommender `recommendations.list` / `insights.list` | Partition/cluster suggestions and table workload insights; cached by project/location for 24 hours | $0 ([read quotas](https://cloud.google.com/recommender/pricing)) |
 | `tabledata.list` | Sample rows (tables only, not views) | $0 |
 | Dry run | Estimated bytes, reported referenced tables, and estimate limitations | $0 |
 | REST `jobs.list` / `jobs.get` | Cost receipts and individual query execution details (`cost-report`, `inspect-job`) | $0 (API quota) |
@@ -78,7 +81,7 @@ Tables that require a partition filter get one in every column-cost dry run
 subtracted from each other column, so the costs stay per column. Rows in the NULL
 partition, if any, are not counted, and the command says so.
 
-Each dataset publishes a complete snapshot in one transaction A table or routine deleted between the list call and its get call is skipped
+Each dataset publishes its metadata snapshot in one transaction. Optional row samples, when requested, are attached afterward so metadata is browseable sooner. A table or routine deleted between the list call and its get call is skipped
 with a log line. A failed dataset
 crawl leaves its previous snapshot current; the other datasets in the same command
 still finish and stay committed, and the command then exits with the first error. Dataset aliases are normalized to `project.dataset`. Snapshot IDs
@@ -197,14 +200,19 @@ for scope, permissions, hash behavior and metric limitations.
 
 ### What a harvest keeps
 
-Each `tables.get` response is kept whole (minus the schema, which is stored per column),
-so nothing BigQuery returns is thrown away. These fields are also pulled out for
-search, `describe` and the UI, at no extra BigQuery cost:
+Each `tables.get` response retains its metadata, including the original schema.
+Transport identifiers such as etags and self-links are omitted; view SQL is stored
+separately. Schema paths are also flattened for search. New harvests preserve field
+defaults, precision/scale, maximum length, collation, rounding, range element types
+and other field metadata; older snapshots need a refresh to populate these details.
+These fields are also pulled out for search, `describe` and the UI, at no extra BigQuery cost:
 
 - **Declared keys:** primary and foreign keys. BigQuery does not enforce them, so they
   are join hints, not proof.
 - **Partition guidance:** whether a partition filter is required, partition expiry,
-  and the partition count.
+  partition count and integer-range bounds. Schema columns are marked with their
+  partition role, clustering order and declared key roles; ingestion-time pseudo
+  columns are explained separately.
 - **Storage:** active and long-term bytes, logical and physical, and time-travel bytes.
 - **Governance and lifecycle:** labels, column policy tags, expiry time, the encryption
   key, and the source table of a snapshot or clone.
@@ -227,9 +235,9 @@ uv run sounding routine bigquery-public-data.persistent_udfs.bignumber_add
 
 ### Catalog upgrades
 
-This version uses catalog schema 4. Schema 2 and 3 catalogs are upgraded in place
+This version uses catalog schema 5. Schema 2, 3 and 4 catalogs are upgraded in place
 the first time any Sounding command opens them. Schema 3 adds richer metadata;
-schema 4 adds saved workload reports. Existing snapshots are preserved, and older
+schema 4 adds saved workload reports; schema 5 adds models, row policies, recommendation caches and optional samples. Existing snapshots are preserved, and older
 metadata fields stay unknown until the next harvest. Each migration runs in one
 transaction, so a failed step rolls back without changing its starting schema.
 
@@ -240,24 +248,101 @@ catalog at the same path, and prints a notice. Re-run `sounding harvest` for you
 datasets. Nothing is deleted. A catalog from a *newer* Sounding is refused and left
 untouched.
 
-### Search UI
+### Catalog UI
 
 ```bash
 uv run sounding ui --open      # http://127.0.0.1:8765, localhost only
 ```
 
+The UI opens to a **project → dataset → table** browser over your saved local catalog.
+No sign-in is needed to browse. Choose a project or dataset in the sidebar to scope the
+table list and search; **All projects** searches everything. Project pages list their
+datasets, and dataset pages show saved settings, labels, freshness and routine signatures.
+Empty datasets remain visible, and identically named datasets in different projects stay
+separate. **Reload catalog** reloads the local catalog after a CLI harvest; it does not contact
+Google or sync data. Project and dataset pages have bookmarkable URLs.
+
+The datastore already keys snapshots by the full `project.dataset` identity and stores
+dataset settings separately from tables. The browser groups those latest snapshots by
+project, so existing catalogs work immediately without another harvest or a migration.
+Enter a project ID under **Open a Google Cloud project** and choose **Open & import** to discover and import its datasets immediately. The catalog updates as metadata is saved; empty projects discovered this way are remembered too. Uses existing credentials, with no sign-in flow.
+
 The page has live search over table names, column paths and descriptions, and reports which
 columns matched. Pick a table to see its size, freshness, full-scan cost, and nested schema,
 plus notes, labels, declared keys, storage, and which columns have policy tags.
-The **Cost report** button lists jobs run in the job project over a chosen window, with their billed bytes. Each table page has three free actions, and each one shows its receipt:
+The menu separates **Catalog**, **Cost report**, **Refresh metadata**, and **Docs & API**.
+Documentation includes CLI commands, MCP setup/tools and the internal local HTTP API.
+The Cost report tab lists jobs run in the job project over a chosen window, with their billed bytes.
+Table pages provide these free actions, with receipts:
 - **Column costs:** one dry run per column, drawn as bars.
 - **Preview:** 10 rows via `tabledata.list`.
 - **Cost guard:** paste SQL and see the bytes and dollars it would scan, without running it.
+- **Top queries:** choose 1–180 days (default **30**), a job project, user/project
+  visibility, and rank individual query jobs by billed bytes or slot time. Load
+  history explicitly; **Show SQL & details** uses `jobs.get` and never saves SQL.
 
-Search and table pages never call BigQuery.
+Browsing project, dataset, search and table pages never calls BigQuery. Live actions
+use existing Google credentials; the UI does not sign in or change credentials.
+
+#### Refresh datasets or whole projects
+
+Select one or more projects or datasets under **Refresh metadata**, or start from a
+project/dataset page. Whole-project refresh paginates `datasets.list`, discovering
+accessible non-hidden datasets, including new ones. Overlapping selections are
+deduplicated. Dataset snapshots publish independently; failures keep the previous
+snapshot and other datasets continue. Previously saved datasets no longer visible
+in a project are retained, not treated as deleted. Unreachable locations and access
+failures are reported. No query jobs are created.
+
+The progress display shows completed datasets and discovered metadata items; item
+totals grow during discovery. It stays visible across tabs and browser reloads.
+Status belongs to the current UI/MCP server and is not retained across server
+restarts; completed catalog snapshots persist. A catalog-wide refresh lock prevents
+overlapping refresh jobs, while catalog reads remain available. The original
+`harvest` command retains its existing behavior. Metadata refresh does not recompute
+column dry-run estimates, which belong to their original snapshots.
+
+Models and row-access policies are included in refresh. Dataset pages list models with a detail view; table pages show policy names and expandable filters. Models require `bigquery.models.list` / `bigquery.models.getMetadata`; policies require `bigquery.rowAccessPolicies.list`. Missing permission or an unavailable API is reported as unknown coverage, not “zero models/policies.” Successful metadata is saved and the overall refresh is marked partial.
+
+Partition/cluster recommendations and StatsInsight metadata appear on project, dataset and table pages. Their project/location responses are cached for 24 hours (failed attempts too, to conserve quota). Failed refreshes retain the last good response and mark it stale. Reads require Recommender viewer permissions such as `roles/recommender.bigqueryPartitionClusterViewer` and an enabled Recommender API; Sounding does not enable APIs or apply suggestions. `sounding model project.dataset.model` and `sounding recommendations project` read this saved metadata, as do MCP `describe_model` and `project_recommendations`.
+
+Row samples are **not included by default**. To opt in:
+
+```sh
+uv run sounding harvest my-project.analytics --include-preview-rows
+uv run sounding refresh --project my-project --include-preview-rows
+```
+
+**Warning: including preview rows can add a material delay**, and saves actual data locally. Both commands print this warning before starting. One measurement on seven public tables took 0.64 seconds for `tables.get` versus 19.86 seconds for their sample reads (70 rows, about 21 KB); this is illustrative, not a general timing guarantee. Up to 10 rows / 256 KiB of serialized JSON are saved per native table or snapshot using free `tabledata.list`, with no SQL fallback. The storage cap does not bound network response size. Samples have arbitrary ordering and a saved timestamp; denied reads are explicit. A metadata-only refresh does not copy samples into its new snapshot. Older snapshots can still contain previously saved data. The table UI's **Load 10 rows / Refresh sample** explicitly reads and saves one table's sample on demand.
+
+```bash
+uv run sounding refresh my-project.analytics other-project.sales
+uv run sounding refresh --project my-project --project other-project
+uv run sounding harvest --project my-project --project other-project
+uv run sounding browse
+uv run sounding show orders --dataset my-project.analytics
+uv run sounding table-queries my-project.analytics.orders --days 30 --project job-project
+```
+
+`harvest --project` uses the same project discovery and progress flow as `refresh`.
+Repeat `--project` for multiple projects; explicit datasets can be included and are deduplicated.
+`refresh` and project-level `harvest` print final JSON to stdout and terminal progress to stderr; partial or
+failed refreshes exit with code 2. A request accepts up to 25 projects and 1000
+explicit datasets; whole projects can discover more datasets.
+
+Table query history uses free `jobs.list` and scans at most the **newest 1000
+completed top-level jobs** in the selected job project. It matches reported table
+or logical-view references, excludes failed jobs and script parents, and does not
+search script child jobs. Missing references, redacted metadata, other job projects,
+unreachable regions and truncation can leave gaps. Project-wide full metadata
+requires `bigquery.jobs.listAll`; ordinary job-list access can yield redacted jobs.
+Results are individual executions, with whole-job metrics rather than costs
+attributable to this table. Empty results do not prove no usage; inspect warnings.
+Unlike the opt-in workload scan, this does not query INFORMATION_SCHEMA or group
+by normalized SQL hashes. See [Google's jobs.list reference](https://docs.cloud.google.com/bigquery/docs/reference/rest/v2/jobs/list).
 
 The UI validates Host and Origin, rejects cross-site requests, and requires a random
-per-server token on API requests. All three BigQuery actions are JSON-only POSTs,
+per-server token on API requests. All BigQuery actions are JSON-only POSTs,
 including preview. Search pages contain at most 100 tables, with a bounded sample
 and total count of matched column paths; **Load more** retrieves the next page.
 Search treats `%`, `_`, and backslashes literally. Table responses and actions are
@@ -271,7 +356,10 @@ discarded when the selection changes, and catalog text is escaped before display
 
 | Tool | Calls BigQuery? |
 | --- | --- |
-| `search_catalog`, `describe_table`, `describe_dataset`, `search_routines`, `describe_routine` | Never |
+| `browse_catalog`, `search_catalog`, `describe_table`, `describe_dataset`, `search_routines`, `describe_routine`, `describe_model`, `project_recommendations` | Never |
+| `refresh_metadata` | Starts a background metadata-only refresh of `datasets` and/or `projects` |
+| `refresh_status` | Never; polls the current/latest refresh on this MCP server |
+| `table_query_history` | Free `jobs.list`; defaults to 30 days and current-identity scope |
 | `preview_rows`, `estimate_query_cost`, `cost_report` | Yes, free calls only; each result carries a receipt or job list |
 | `inspect_query_job` | Yes, free `jobs.get`; SQL is opt-in |
 | `query_opportunities` | Free preview by default; `allow_billed=true` executes one byte-capped metadata query |
@@ -282,6 +370,7 @@ discarded when the selection changes, and catalog text is escaped before display
 per table; `matched_column_count` retains the full count. Search descriptions are
 excerpts; `describe_table` returns the full schema and descriptions. Paging reflects
 the latest catalog at each request, so a concurrent harvest can change page contents.
+Optional `project` and `dataset` parameters scope search by exact identity.
 `search_routines` pages the same way and returns 1000-character body excerpts;
 `describe_routine` returns the whole body, and `describe_dataset` lists signatures only.
 `preview_rows` returns `{rows, receipt}`, accepts 1–50 rows and rejects views/external tables without querying
@@ -309,9 +398,9 @@ and the Python MCP SDK is the reference implementation.
 2. Snapshot diffs: row-count growth, schema drift, late tables
 3. Table families: collapse date shards (`ga_sessions_*`, `gsod*`)
 4. Join inference from column name, type and value overlap
-5. ✅ Search UI (`sounding ui`) with column costs, preview and a dry-run cost guard; next: an overview page
+5. ✅ Catalog UI (`sounding ui`) with project and dataset overviews, scoped search, column costs, preview and a dry-run cost guard
 6. Opt-in billed profiling behind a byte cap and approval, with results cached in the catalog
-7. ✅ Keep the whole table resource (keys, partition guidance, storage, labels, policy tags), dataset settings and routines; next: BigQuery ML models and row-access policy metadata
+7. ✅ Keep table metadata, dataset settings, routines, BigQuery ML models, row-access policies and cached partition/cluster recommendations
 8. ✅ Opt-in query opportunity scans, saved reports and free job inspection; next: workload trends and a UI for reports
 
 ## Stability
