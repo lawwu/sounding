@@ -46,12 +46,15 @@ sounding refresh my-project.analytics other-project.sales
 # Whole projects, including newly visible datasets
 sounding refresh --project my-project --project other-project
 
+# Harvest also accepts whole projects (same discovery and progress)
+sounding harvest --project my-project --project other-project
+
 # Original dataset harvester
 sounding harvest my-project.analytics</pre>
     <pre># Optional actual row data; WARNING: can add a material delay
 sounding harvest my-project.analytics --include-preview-rows
 sounding refresh --project my-project --include-preview-rows</pre>
-    <p>Refresh prints the final result as JSON to stdout and progress to stderr. Partial or failed refreshes exit with code 2. One refresh per catalog can run at a time; reads remain available.</p>
+    <p>Refresh and project-level harvest print the final result as JSON to stdout and progress to stderr. Partial or failed imports exit with code 2. One refresh per catalog can run at a time; reads remain available. Repeat <code>--project</code> to include several projects; explicitly named datasets are combined with discovered datasets without duplicates.</p>
     <h3>Inspect cost and usage</h3>
     <pre>sounding column-costs my-project.analytics.orders
 sounding estimate 'SELECT order_id FROM `my-project.analytics.orders`'

@@ -318,12 +318,15 @@ uv run sounding refresh --project my-project --include-preview-rows
 ```bash
 uv run sounding refresh my-project.analytics other-project.sales
 uv run sounding refresh --project my-project --project other-project
+uv run sounding harvest --project my-project --project other-project
 uv run sounding browse
 uv run sounding show orders --dataset my-project.analytics
 uv run sounding table-queries my-project.analytics.orders --days 30 --project job-project
 ```
 
-`refresh` prints final JSON to stdout and terminal progress to stderr; partial or
+`harvest --project` uses the same project discovery and progress flow as `refresh`.
+Repeat `--project` for multiple projects; explicit datasets can be included and are deduplicated.
+`refresh` and project-level `harvest` print final JSON to stdout and terminal progress to stderr; partial or
 failed refreshes exit with code 2. A request accepts up to 25 projects and 1000
 explicit datasets; whole projects can discover more datasets.
 

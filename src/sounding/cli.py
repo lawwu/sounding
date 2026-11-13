@@ -1,6 +1,7 @@
 """sounding: take a sounding before you dive.
 
   sounding harvest bigquery-public-data.thelook_ecommerce [more datasets...]
+  sounding harvest --project my-project [--project other-project]
   sounding refresh [project.dataset ...] [--project project-id ...]
   sounding browse                     # local project/dataset hierarchy
   sounding show [text]                 # catalog only, no BigQuery call
@@ -32,11 +33,11 @@ def _main() -> None:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
     harvest_cmd = sub.add_parser("harvest", help="crawl datasets into the catalog (free calls only)")
-    harvest_cmd.add_argument("datasets", nargs="+")
+    harvest_cmd.add_argument("datasets", nargs="*")
     refresh_cmd = sub.add_parser("refresh", help="refresh datasets or whole projects with progress (free metadata calls)")
     refresh_cmd.add_argument("datasets", nargs="*")
-    refresh_cmd.add_argument("--project", action="append", default=[], help="discover and refresh a whole project; repeat for multiple projects")
     for command in (harvest_cmd, refresh_cmd):
+        command.add_argument("--project", action="append", default=[], help="discover and import a whole project; repeat for multiple projects")
         command.add_argument("--include-preview-rows", action="store_true",
                              help="save up to 10 rows / 256 KB per table; WARNING: can add a material delay and stores actual data locally")
     sub.add_parser("browse", help="local project and dataset hierarchy")
@@ -86,6 +87,8 @@ def _main() -> None:
     ui.add_argument("--port", type=int, default=8765)
     ui.add_argument("--open", action="store_true", help="open it in your browser")
     a = p.parse_args()
+    if a.cmd == "harvest" and not (a.datasets or a.project):
+        p.error("harvest requires at least one dataset or --project PROJECT_ID")
 
     # Imports are deferred so `sounding --help` stays fast.
     if a.cmd == "mcp":
@@ -99,10 +102,10 @@ def _main() -> None:
     if getattr(a, "include_preview_rows", False):
         print("Warning: including preview rows can add a material delay (one extra data-read request per native table). "
               "Up to 10 rows / 256 KB per table will be stored locally. Metadata is saved before row downloads finish.", file=sys.stderr)
-    if a.cmd == "harvest":
+    if a.cmd == "harvest" and not a.project:
         kwargs = {"include_preview_rows": True} if a.include_preview_rows else {}
         print(_receipt_line(bq.harvest(a.datasets, for_terminal("harvesting"), **kwargs)), file=sys.stderr)
-    elif a.cmd == "refresh":
+    elif a.cmd in ("refresh", "harvest"):
         from .refresh import Job
         result = Job(a.datasets, a.project, for_terminal("refreshing"), include_preview_rows=a.include_preview_rows).run()
         print(json.dumps(result, indent=2))
