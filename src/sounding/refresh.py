@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import os
 import time
 from pathlib import Path
@@ -26,6 +27,53 @@ from filelock import FileLock, Timeout
 from . import bq, catalog, workload
 from .errors import SoundingError, public_error, text, integer
 from .progress import Quiet
+
+
+ACTIVE_STATUSES = frozenset({"pending", "running"})
+FINISHED_STATUSES = frozenset({"complete", "partial", "failed", "interrupted"})
+FINISHED_ROWS = frozenset({"complete", "partial", "failed"})
+# Resume restores work into a new pending attempt; it never reopens a finished Job.
+TRANSITIONS = {
+    "pending": {"running", "failed"},
+    "running": FINISHED_STATUSES,
+    **{status: set() for status in FINISHED_STATUSES},
+}
+
+
+def _snapshot(state):
+    result = copy.deepcopy(state)
+    rows = result["datasets"]
+    result["progress"] = {"datasets_done": sum(r["status"] in FINISHED_ROWS for r in rows),
+                          "datasets_total": len(rows), "done": sum(r["done"] for r in rows),
+                          "total": sum(r["total"] for r in rows)}
+    return result
+
+
+def _read_checkpoint(path):
+    """Check persisted state before polling or resuming it; leave bad files untouched."""
+    try:
+        state = json.loads(path.read_text())
+        if not isinstance(state, dict) or state.get("status") not in ACTIVE_STATUSES | FINISHED_STATUSES:
+            raise ValueError
+        if not isinstance(state.get("id"), str) or not isinstance(state.get("started_at"), str):
+            raise ValueError
+        dt.datetime.fromisoformat(state["started_at"])
+        if state.get("finished_at") is not None:
+            dt.datetime.fromisoformat(state["finished_at"])
+        for collection, identity in (("projects", "project"), ("datasets", "dataset")):
+            if not isinstance(state.get(collection), list):
+                raise ValueError
+            for row in state[collection]:
+                if (not isinstance(row, dict) or not isinstance(row.get(identity), str)
+                        or row.get("status") not in {"queued", "running"} | FINISHED_ROWS | {"interrupted"}):
+                    raise ValueError
+                if collection == "datasets" and any(type(row.get(k)) is not int or row[k] < 0 for k in ("done", "total")):
+                    raise ValueError
+        return _snapshot(state)
+    except FileNotFoundError:
+        raise
+    except (OSError, ValueError, TypeError) as error:
+        raise SoundingError("Saved refresh progress could not be read. Start a new refresh instead of resuming.") from error
 
 
 def targets(datasets=None, projects=None):
@@ -87,6 +135,9 @@ class Job:
         self.include_preview_rows = include_preview_rows
         self.progress = progress or Quiet()
         self.lock = threading.RLock()
+        self._started = False
+        self.finished = threading.Event()
+        self.checkpoint_saved = False
         self.state = {"id": uuid.uuid4().hex, "status": "pending", "phase": "discovering",
                       "started_at": dt.datetime.now(dt.UTC).isoformat(), "finished_at": None,
                       "requested_datasets": self.datasets, "requested_projects": self.projects,
@@ -96,35 +147,59 @@ class Job:
 
     def snapshot(self):
         with self.lock:
-            result = copy.deepcopy(self.state)
-        rows = result["datasets"]
-        result["progress"] = {"datasets_done": sum(r["status"] in ("complete", "partial", "failed") for r in rows),
-                              "datasets_total": len(rows), "done": sum(r["done"] for r in rows),
-                              "total": sum(r["total"] for r in rows)}
-        return result
+            return _snapshot(self.state)
+
+    def _transition(self, status, *, message=None):
+        """Change job status, phase and timestamps together, under the snapshot lock."""
+        with self.lock:
+            if status not in TRANSITIONS[self.state["status"]]:
+                raise RuntimeError(f"Invalid refresh transition: {self.state['status']} -> {status}")
+            self.state.update(status=status, message=message,
+                              phase="discovering" if status == "running" else "finished",
+                              finished_at=None if status == "running" else dt.datetime.now(dt.UTC).isoformat())
+            if status == "running":
+                self.state["started_at"] = dt.datetime.now(dt.UTC).isoformat()
+            else:
+                for row in self.state["projects"] + self.state["datasets"]:
+                    if row["status"] == "running":
+                        row.update(status="interrupted", message="This attempt stopped before the work finished.")
 
     def run(self):
+        with self.lock:
+            if self._started:
+                raise SoundingError("This refresh job has already started. Create a new job to refresh or resume.")
+            self._started = True
         try:
             catalog.CATALOG.parent.mkdir(parents=True, exist_ok=True)
             with FileLock(str(catalog.CATALOG) + ".refresh.lock", timeout=0):
                 if self.resume:
                     self._restore()
-                with self.lock:
-                    self.state["status"] = "running"
-                    self.state["finished_at"] = None
-                    self.state["message"] = None
-                self._checkpoint()
-                self._run()
-                self.state["finished_at"] = dt.datetime.now(dt.UTC).isoformat()
-                self._checkpoint()
+                self._transition("running")
+                try:
+                    self._checkpoint()
+                    self._transition(self._run())
+                except Exception as error:
+                    self._transition("failed", message=public_error(error)[0])
+                except BaseException:
+                    self._transition("interrupted", message="Import interrupted. Resume the saved import to continue.")
+                    raise
+                finally:
+                    # Persist terminal failures as well as successes, before releasing
+                    # ownership. Failure to save progress cannot undo published data.
+                    try:
+                        self._checkpoint()
+                    except Exception:
+                        logging.exception("Could not save refresh progress")
+                        with self.lock:
+                            self.state["warnings"].append("Could not save refresh progress. The saved checkpoint may be out of date; inspect the catalog before resuming.")
         except Exception as error:
             message = "Another metadata refresh is running for this catalog. Try again when it finishes." if isinstance(error, Timeout) else public_error(error)[0]
-            with self.lock:
-                self.state.update(status="failed", message=message)
+            self._transition("failed", message=message)
         finally:
-            with self.lock:
-                self.state["finished_at"] = dt.datetime.now(dt.UTC).isoformat()
-            self.progress.close()
+            try:
+                self.progress.close()
+            finally:
+                self.finished.set()
         return self.snapshot()
 
     def _checkpoint(self):
@@ -132,16 +207,25 @@ class Job:
             temporary = self.checkpoint.with_suffix('.json.tmp')
             temporary.write_text(json.dumps(self.snapshot()))
             os.replace(temporary, self.checkpoint)
+            self.checkpoint_saved = True
 
     def _restore(self):
         if not self.checkpoint.exists():
             raise SoundingError("No saved refresh exists for this catalog.")
-        previous = json.loads(self.checkpoint.read_text())
+        previous = _read_checkpoint(self.checkpoint)
         for key in ('requested_datasets', 'requested_projects', 'include_preview_rows', 'inventory_only', 'filters'):
             if previous.get(key) != self.state[key]:
                 raise SoundingError("Resume requires the same projects, datasets, filters and import mode as the saved refresh.")
-        previous['project_concurrency'] = self.project_concurrency
-        self.state = previous
+        previous.update(project_concurrency=self.project_concurrency, status="pending", phase="discovering",
+                        finished_at=None, message=None, warnings=[])
+        for row in previous["projects"] + previous["datasets"]:
+            if row["status"] != "complete":
+                row.update(status="queued", message=None)
+                row.pop("receipt", None)
+                if "dataset" in row:
+                    row.update(done=0, total=0)
+        with self.lock:
+            self.state = previous
 
     def _allowed(self, dataset):
         name = dataset.rsplit('.', 1)[-1]
@@ -167,7 +251,8 @@ class Job:
             pass
         datasets = list(self.datasets)
         previous_projects = {r['project']: r for r in self.state['projects']}
-        self.state['projects'] = [previous_projects.get(p, {"project": p, "status": "queued", "datasets": 0, "message": None}) for p in self.projects]
+        with self.lock:
+            self.state['projects'] = [previous_projects.get(p, {"project": p, "status": "queued", "datasets": 0, "message": None}) for p in self.projects]
         def discover(row):
             project = row['project']
             if row['status'] == 'complete' and 'discovered_datasets' in row:
@@ -213,11 +298,11 @@ class Job:
             succeeded = any(r["status"] in ("complete", "partial") for r in self.state["datasets"])
             if not self.state["datasets"]:
                 succeeded = any(r["status"] == "complete" for r in self.state["projects"])
-            self.state["status"] = "partial" if failed and succeeded else "failed" if failed else "complete"
+            outcome = "partial" if failed and succeeded else "failed" if failed else "complete"
             self.state["warnings"] = ["Dataset filters apply to this refresh only. Previously saved datasets are retained; they are not evidence of current access."]
             if self.inventory_only:
                 self.state['warnings'].append('Inventory mode omits schemas, view SQL and auxiliary metadata. Load table metadata explicitly for details.')
-            self.state["phase"] = "finished"
+            return outcome
 
 
     def _dataset(self, row):
@@ -250,25 +335,54 @@ class Manager:
     def start(self, datasets=None, projects=None, **options):
         job = Job(datasets, projects, **options)
         with self.lock:
-            if self.job and self.job.snapshot()["status"] in ("pending", "running"):
+            if self.job and not self.job.finished.is_set():
                 raise SoundingError("A metadata refresh is already running.")
+            previous = self.job
             self.job = job
-            threading.Thread(target=job.run, daemon=True).start()
+            try:
+                threading.Thread(target=job.run, daemon=True).start()
+            except BaseException:
+                self.job = previous
+                raise
             return job.snapshot()
 
     def snapshot(self):
         with self.lock:
-            if self.job:
-                return self.job.snapshot()
+            local = self.job.snapshot() if self.job else None
+            if local and not self.job.finished.is_set():
+                return local
+            def observed(state):
+                # Keep submission errors separate from the import that can actually
+                # be resumed. Rejected requests never published their own checkpoint.
+                if local and not self.job.checkpoint_saved and local.get('message'):
+                    state['submission_error'] = local['message']
+                return state
             checkpoint = Path(str(catalog.CATALOG) + '.refresh.json')
             try:
-                state = json.loads(checkpoint.read_text())
-            except (OSError, ValueError):
-                return {"status": "idle"}
-            if state['status'] in ('pending', 'running'):
+                state = _read_checkpoint(checkpoint)
+            except FileNotFoundError:
+                return local or {"status": "idle"}
+            except SoundingError as error:
+                return {"status": "interrupted", "message": str(error)}
+            if state['status'] in ACTIVE_STATUSES:
                 try:
                     with FileLock(str(catalog.CATALOG) + '.refresh.lock', timeout=0):
-                        state.update(status='interrupted', message='Import interrupted. Resume the saved import to continue.')
+                        # The worker may have finished between the read and the lock.
+                        state = _read_checkpoint(checkpoint)
+                        if state['status'] in ACTIVE_STATUSES:
+                            state.update(status='interrupted', phase='finished', finished_at=None,
+                                         message='Import interrupted. Resume the saved import to continue.')
+                            for row in state['projects'] + state['datasets']:
+                                if row['status'] == 'running':
+                                    row.update(status='interrupted')
                 except Timeout:
-                    pass  # A CLI or another server still owns the refresh.
-            return state
+                    return observed(state)  # A CLI or another server still owns the refresh.
+                except (FileNotFoundError, SoundingError):
+                    return {"status": "interrupted", "message": "Saved refresh progress changed. Read status again or start a new refresh."}
+            # Atomic publication, not wall-clock ordering, identifies the latest
+            # attempt. Prefer memory only for our own checkpoint (e.g. final save
+            # failed); a clock adjustment cannot hide another process's import.
+            if (local and self.job.checkpoint_saved
+                    and (local['id'], local['started_at']) == (state['id'], state['started_at'])):
+                return local
+            return observed(state)

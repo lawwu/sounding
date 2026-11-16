@@ -51,8 +51,11 @@ def create_server() -> MCPServer:
                                      include_datasets=include_datasets, exclude_datasets=exclude_datasets,
                                      include_hidden=include_hidden, project_concurrency=project_concurrency, resume=resume)
 
-    @app.tool(description="Poll the current or last metadata refresh started by this MCP server. Local only. "
-              "Returns status, progress, per-project discovery results and per-dataset outcomes. Saved checkpoints survive restarts; interrupted runs can be resumed.")
+    @app.tool(description="Poll the current or latest metadata refresh for this catalog, including CLI and other servers. Local only. "
+              "Status is idle when none exists, pending/running while active, or complete/partial/failed/interrupted when stopped. "
+              "Returns phase, progress, per-project discovery results and per-dataset outcomes. Resume uses the same targets, filters and mode, "
+              "keeps the import id, starts a new started_at timestamp and skips completed datasets. Saved checkpoints survive restarts. "
+              "If a request was rejected before saving a checkpoint, submission_error explains it; the returned targets still belong to the saved import.")
     @tool_errors
     def refresh_status() -> dict:
         return refresh_manager.snapshot()

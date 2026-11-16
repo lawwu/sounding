@@ -326,6 +326,24 @@ def test_column_costs_failure_does_not_partially_cache(seed, monkeypatch):
         assert con.execute("SELECT count(*) FROM columns WHERE scan_bytes IS NOT NULL").fetchone()[0] == 0
 
 
+@pytest.mark.parametrize('change', ['schema', 'partition'])
+def test_column_costs_reject_metadata_replaced_within_the_same_snapshot(seed, monkeypatch, change):
+    sid = seed()
+    def dry(sql):
+        row = table_row()
+        columns = [column_row('replacement')] if change == 'schema' else [column_row()]
+        if change == 'partition':
+            row.update(partitioning='DAY:id', require_partition_filter=True)
+        catalog.save_table_metadata('p.d.t', sid, row, columns)
+        return {'bytes':99}
+    monkeypatch.setattr(bq, 'dry_run', dry)
+    with pytest.raises(SoundingError, match='changed while estimating'):
+        bq.column_costs('p.d.t')
+    with catalog.connect() as con:
+        assert catalog.describe(con, 'p.d.t')['snapshot_id'] == sid
+        assert con.execute('SELECT count(*) FROM column_measurements').fetchone()[0] == 0
+
+
 @pytest.mark.parametrize("n",[-1,0,51,True])
 def test_preview_bounds(n):
     with pytest.raises(SoundingError): bq.preview("p.d.t",n)

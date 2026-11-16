@@ -272,6 +272,13 @@ discover datasets added since then. A crash between publishing a dataset and sav
 its checkpoint can cause that dataset to be imported again. New runs replace the last
 checkpoint, but do not remove catalog history.
 
+Resume preserves the import ID and starts a new `started_at` timestamp for the
+attempt. Stopped attempts report `complete`, `partial`, `failed` or `interrupted`;
+only `pending` and `running` are active. Failures are checkpointed while the refresh
+still owns its lock. An unreadable checkpoint requires a new refresh.
+Rejected requests report `submission_error` separately from the saved import's
+status, keeping its original targets available for resume.
+
 `--project-concurrency` accepts 1–4 (default 1). Each active project retains the existing
 limits of four concurrent datasets and sixteen table requests per dataset, so higher
 project concurrency increases total API load. The Refresh metadata page exposes these
@@ -359,8 +366,10 @@ failures are reported. No query jobs are created.
 
 The progress display shows completed datasets and discovered metadata items; item
 totals grow during discovery. It stays visible across tabs and browser reloads.
-Status belongs to the current UI/MCP server and is not retained across server
-restarts; completed catalog snapshots persist. A catalog-wide refresh lock prevents
+Status is checkpointed beside the catalog and survives server restarts. Once a local
+worker finishes, status reads also follow newer imports from the CLI or another server.
+A saved active import with no lock owner is reported as interrupted and can be resumed.
+A catalog-wide refresh lock prevents
 overlapping refresh jobs, while catalog reads remain available. The original
 `harvest` command retains its existing behavior. Metadata refresh does not recompute
 column dry-run estimates, which belong to their original snapshots.
@@ -440,7 +449,7 @@ discarded when the selection changes, and catalog text is escaped before display
 | --- | --- |
 | `browse_catalog`, `search_catalog`, `describe_table`, `describe_dataset`, `search_routines`, `describe_routine`, `describe_model`, `project_recommendations` | Never |
 | `refresh_metadata` | Starts a background metadata-only refresh of `datasets` and/or `projects` |
-| `refresh_status` | Never; polls the current/latest refresh on this MCP server |
+| `refresh_status` | Never; polls the current/latest refresh for this catalog, including saved checkpoints |
 | `table_query_history` | Free `jobs.list`; defaults to 30 days and current-identity scope |
 | `preview_rows`, `estimate_query_cost`, `cost_report` | Yes, free calls only; each result carries a receipt or job list |
 | `inspect_query_job` | Yes, free `jobs.get`; SQL is opt-in |
@@ -517,6 +526,12 @@ the JavaScript security, pagination and stale-response tests (run by pytest;
 skipped with an explicit reason if Node is missing). CI installs Node and runs the
 full suite. Tests also cover process/thread locks, rollback, Arrow field mapping,
 legacy catalogs, UTC round trips, price minimums, HTTP security, and MCP over stdio.
+
+The [state machine map](docs/state-machines.md) records runtime lifecycles, transition
+owners, recovery rules, and the regression tests protecting them. Start there when
+changing refresh coordination, asynchronous UI actions, or delayed catalog writes.
+The [Elephant–Goldfish review](docs/egm-review.md) records the independent findings,
+resolutions, and verification evidence for these changes.
 
 The GitHub Actions workflows are locked: `.github/workflows/actions.lock` records the
 exact commit of every action, and CI fails if a workflow uses one it doesn't record or

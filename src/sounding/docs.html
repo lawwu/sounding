@@ -10,7 +10,7 @@
     <p>Catalog pages read saved metadata. No Google credentials or Google calls are needed to browse projects, datasets, table schemas and saved estimates.</p>
     <p>Enter a project ID under <b>Open a Google Cloud project</b> and choose <b>Open &amp; import</b>. Sounding starts importing its accessible datasets immediately, using existing credentials. Datasets appear as metadata is saved; progress stays visible while you browse.</p>
     <p><b>Reload catalog</b> rereads the local file. <b>Refresh metadata</b> contacts BigQuery using existing Google credentials and saves new snapshots. A whole-project refresh discovers accessible, non-hidden datasets. Select several projects or datasets to refresh together; overlapping selections are deduplicated.</p>
-    <p>Each dataset is published atomically. A failure retains its previous snapshot while other datasets finish. Datasets no longer visible in a project are retained locally. Refresh status survives browser reloads, but is held in the server's memory and disappears when that server restarts. Completed snapshots remain on disk.</p>
+    <p>Each dataset is published atomically. A failure retains its previous snapshot while other datasets finish. Datasets no longer visible in a project are retained locally. Refresh progress is saved beside the catalog and survives browser and server restarts. Status reads also follow newer imports from the CLI or another server after the local worker finishes. Interrupted imports can be resumed with the same targets, filters and mode.</p>
     <h3>Free metadata and explicit actions</h3>
     <p>Metadata refresh, previews, job history and dry runs use free BigQuery API operations. Column-cost refresh runs one dry run per top-level column; user SQL never executes. Refreshing metadata does not recalculate saved column estimates.</p>
     <p>Schema badges mark partition columns, clustering order, declared keys and policy tags. Declared primary and foreign keys are not enforced by BigQuery. Ingestion-time partitioning uses virtual columns. Range bounds, partition expiry, labels, storage, table expiry and lineage are shown when present in the snapshot.</p>
@@ -93,7 +93,7 @@ sounding query-report</pre>
       <tr><td><code>browse_catalog</code>, <code>search_catalog</code>, <code>describe_table</code>, <code>describe_dataset</code></td><td>Local project/dataset hierarchy, scoped search and metadata. Search accepts project/dataset filters and returns items + next_offset.</td></tr>
       <tr><td><code>search_routines</code>, <code>describe_routine</code></td><td>Local functions, procedures, signatures and definitions.</td></tr>
       <tr><td><code>describe_model</code>, <code>project_recommendations</code></td><td>Local model metadata and cached recommendations/insights with coverage.</td></tr>
-      <tr><td><code>refresh_metadata</code>, <code>refresh_status</code></td><td>Start a background refresh with datasets and/or projects, then poll on the same MCP server. Free metadata calls.</td></tr>
+      <tr><td><code>refresh_metadata</code>, <code>refresh_status</code></td><td>Start a background refresh with datasets and/or projects, then poll the catalog's latest status. Free metadata calls.</td></tr>
       <tr><td><code>preview_rows</code>, <code>estimate_query_cost</code></td><td>Free previews and dry runs with receipts; unknown estimates remain unknown.</td></tr>
       <tr><td><code>cost_report</code>, <code>table_query_history</code>, <code>inspect_query_job</code></td><td>Free job metadata. Table history defaults to 30 days; SQL inspection requires include_sql=true.</td></tr>
       <tr><td><code>query_opportunities</code></td><td>Free preview by default. allow_billed=true requires authorization for one capped metadata scan.</td></tr>
@@ -115,7 +115,7 @@ table_query_history(table="my-project.analytics.orders", days=30)</pre>
       <tr><td>GET <code>/api/model</code>, <code>/api/recommendations</code></td><td>fqn or project query parameter; saved data only.</td></tr>
       <tr><td>GET <code>/api/stats</code>, <code>/api/docs</code></td><td>Local catalog totals or this documentation.</td></tr>
       <tr><td>POST <code>/api/refresh</code></td><td>datasets and/or projects arrays; 202 with background job status.</td></tr>
-      <tr><td>GET <code>/api/refresh</code></td><td>Latest refresh state and progress for this UI server.</td></tr>
+      <tr><td>GET <code>/api/refresh</code></td><td>Current or latest refresh state and saved progress for this catalog.</td></tr>
       <tr><td>POST <code>/api/table-queries</code></td><td>table, days (30), project (optional), scope (user), rank_by (billed_bytes), limit (20).</td></tr>
       <tr><td>POST <code>/api/inspect-job</code></td><td>job_id, location, project (optional), include_sql (false).</td></tr>
       <tr><td>POST <code>/api/cost-report</code></td><td>hours (24).</td></tr>
@@ -123,7 +123,7 @@ table_query_history(table="my-project.analytics.orders", days=30)</pre>
       <tr><td>POST <code>/api/refresh-sample</code></td><td>fqn; explicitly fetch and save up to 10 rows / 256 KiB, returning updated table metadata.</td></tr>
       <tr><td>POST <code>/api/estimate</code></td><td>sql; dry run only.</td></tr>
     </tbody></table></div>
-    <p>Refresh status is idle, pending, running, complete, partial or failed. Per-dataset outcomes and sanitized messages explain failures. Progress totals grow as metadata is discovered. A new server does not resume interrupted work.</p>
+    <p>Refresh status is idle, pending, running, complete, partial, failed or interrupted. Only pending and running are active. Per-dataset outcomes and sanitized messages explain failures. A rejected request is reported separately as <code>submission_error</code>, preserving the saved import's resume targets. Progress totals grow as metadata is discovered. Resume is explicit: it keeps the import ID, starts a new attempt timestamp, skips completed work and retries unfinished targets.</p>
   </section>
 
 <section><h3>Smaller catalogs and resumable imports</h3>

@@ -453,17 +453,18 @@ def harvest_inventory(datasets, progress=None):
 
 
 def load_table_metadata(fqn):
-    """Explicitly hydrate one inventory entry, refusing a concurrent dataset refresh."""
+    """Hydrate explicitly, rejecting concurrent snapshot or table metadata changes."""
     text(fqn, "table")
     with catalog.connect() as con:
         previous = catalog.describe(con, fqn)
+        revision = catalog.metadata_revision(con, fqn)
     c = client()
     try:
         remote = c.get_table(fqn)
         row, columns = table_record(remote.to_api_repr(), previous['dataset'])
         row.update(row_access_policies(c, remote))
         row['metadata_level'] = 'full'
-        catalog.save_table_metadata(fqn, previous['snapshot_id'], row, columns)
+        catalog.save_table_metadata(fqn, previous['snapshot_id'], row, columns, expected_revision=revision)
     finally:
         c.close()
     with catalog.connect() as con:
@@ -571,12 +572,13 @@ def quote_identifier(name: str) -> str:
 
 
 def column_costs(fqn: str, progress: Quiet | None = None) -> dict:
-    """Compute outside the lock, then atomically cache only against the unchanged current snapshot.
+    """Compute outside the lock, then cache only against unchanged table metadata.
 
     Returns {"columns": [(path, bytes)], "receipt": ...}, the receipt covering every dry run.
     """
     with catalog.connect() as con:
         table = catalog.describe(con, fqn)
+        revision = catalog.metadata_revision(con, fqn)
     if table["type"] != "TABLE":
         raise SoundingError("Column costs require a native table.")
     if table.get('metadata_level') == 'inventory':
@@ -615,8 +617,9 @@ def column_costs(fqn: str, progress: Quiet | None = None) -> dict:
     if partition_col and base is None:
         out = [(col, None if col != partition_col else b) for col, b in out]
     with catalog.connect(write=True) as con:
-        if catalog.describe(con, fqn)["snapshot_id"] != table["snapshot_id"]:
-            raise SoundingError("The catalog changed while estimating columns. Retry against the new snapshot.")
+        catalog.describe(con, fqn)  # Preserve the missing-table error if it disappeared.
+        if catalog.metadata_revision(con, fqn) != revision:
+            raise SoundingError("The catalog changed while estimating columns. Retry against the current table metadata.")
         con.execute("BEGIN")
         try:
             for col, size in out:

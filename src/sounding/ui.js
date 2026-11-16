@@ -31,11 +31,13 @@ function receiptHtml(r) {
 
 let current = null, seq = 0, viewSeq = 0, renderSeq = 0, estimateSeq = 0;
 let nextOffset = null, displayed = 0;
-let hierarchy = [], scopeProject = "", scopeDataset = "", browseSeq = 0;
+let hierarchy = [], scopeProject = "", scopeDataset = "", browseSeq = 0, statsSeq = 0;
 let detailKind = "overview";
-let appPage = "catalog", refreshState = {status: "idle"}, refreshTimer, refreshPolling = false, completedRefresh = null, refreshGeneration = 0;
+let appPage = "catalog", refreshState = {status: "idle"};
+// Server work and browser requests have independent lifetimes. All three import
+// entry points share this submission gate; polling never reads across a submission.
+const refreshFlow = {submission: "idle", polling: "idle", generation: 0, timer: null, completed: null, imported: ""};
 let selectedProjects = new Set(), selectedDatasets = new Set();
-let importedProgress = "", projectOpening = false;
 
 function setPage(page) {
   appPage = page;
@@ -67,25 +69,47 @@ async function docsPage() {
 }
 
 function isRefreshing() { return ["pending", "running"].includes(refreshState.status); }
+function refreshBusy() { return refreshFlow.submission === "submitting" || isRefreshing(); }
+
+async function submitRefresh(body) {
+  if (refreshBusy()) return false;
+  refreshFlow.submission = "submitting";
+  ++refreshFlow.generation;
+  clearTimeout(refreshFlow.timer);
+  updateRefreshProgress();
+  try {
+    refreshState = await api("/api/refresh", body);
+    refreshFlow.completed = null;
+    refreshFlow.imported = "";
+    return true;
+  } finally {
+    refreshFlow.submission = "idle";
+    updateRefreshProgress();
+    // A lost POST response does not prove the server rejected the import.
+    pollRefresh();
+  }
+}
 
 function progressHtml(s) {
   if (s.status === "idle") return "";
   const p = s.progress, active = ["pending", "running"].includes(s.status);
   const label = active ? (s.phase === "discovering" ? "Discovering datasets…" : "Refreshing metadata…") : `Refresh ${s.status}`;
   const finished = p?.datasets_done || 0, total = p?.datasets_total || 0;
-  return `<strong class="status-${esc(s.status)}">${label}</strong>
-    <progress aria-label="Metadata refresh progress" ${s.phase === "discovering" ? "" : `max="${Math.max(total, 1)}" value="${active ? finished : Math.max(total, 1)}"`}></progress>
+  const value = s.status === "complete" && !total ? 1 : Math.min(finished, total);
+  return `<strong class="status-${esc(s.status)}">${esc(label)}</strong>
+    <progress aria-label="Metadata refresh progress" ${active && s.phase === "discovering" ? "" : `max="${Math.max(total, 1)}" value="${value}"`}></progress>
     <div class="hint">${finished} / ${total} datasets finished${p?.total ? ` · ${num(p.done)} / ${num(p.total)} discovered metadata items processed` : ""}</div>
-    ${s.message ? `<p class="err">${esc(s.message)}</p>` : ""}`;
+    ${s.message ? `<p class="err">${esc(s.message)}</p>` : ""}
+    ${s.submission_error ? `<p class="err">Last refresh request: ${esc(s.submission_error)}</p>` : ""}`;
 }
 
 function updateRefreshProgress() {
-  $("#open-project").disabled = isRefreshing() || projectOpening;
+  $("#open-project").disabled = refreshBusy();
   $("#refresh-banner").hidden = refreshState.status === "idle";
   $("#refresh-banner").innerHTML = progressHtml(refreshState) + '<button data-page="refresh">View refresh</button>';
   if (appPage !== "refresh" || !$("#refresh-progress")) return;
-  $("#start-refresh").disabled = isRefreshing();
-  if ($("#resume-import")) $("#resume-import").disabled = isRefreshing();
+  $("#start-refresh").disabled = refreshBusy();
+  if ($("#resume-import")) $("#resume-import").disabled = refreshBusy();
   const rows = [...(refreshState.projects || []).map(r => ({...r, target:r.project, progress:`${r.datasets} datasets discovered`})),
     ...(refreshState.datasets || []).map(r => ({...r, target:r.dataset, progress:`${r.done} / ${r.total} items`}))];
   $("#refresh-progress").innerHTML = refreshState.status === "idle" ? '<p class="hint">Choose a scope and start a refresh. Progress will remain visible while you browse other tabs.</p>' :
@@ -113,72 +137,74 @@ function refreshPage(project, dataset) {
     <div id="refresh-error" class="err" role="status"></div><div id="refresh-progress"></div>`;
   $("#start-refresh").onclick = startRefresh;
   if ($("#resume-import")) $("#resume-import").onclick = async () => {
-    $("#resume-import").disabled = true;
-    ++refreshGeneration;
+    if (refreshBusy()) return;
+    $("#refresh-error").textContent = "";
     const my = viewSeq;
     try {
-      refreshState = await api("/api/refresh", {projects:refreshState.requested_projects, datasets:refreshState.requested_datasets,
+      await submitRefresh({projects:refreshState.requested_projects, datasets:refreshState.requested_datasets,
         inventory_only:!!refreshState.inventory_only, include_preview_rows:!!refreshState.include_preview_rows, ...(refreshState.filters || {}),
         project_concurrency:refreshState.project_concurrency || 1, resume:true});
-      updateRefreshProgress(); pollRefresh();
-    } catch (err) { if (my === viewSeq) { $("#refresh-error").textContent = err.message; $("#resume-import").disabled = false; } }
+    } catch (err) { if (my === viewSeq) $("#refresh-error").textContent = err.message; }
   };
   updateRefreshProgress();
 }
 
 async function reloadCatalog() {
+  const view = viewSeq;
   await Promise.all([loadCatalog(), loadStats()]);
-  if (appPage !== "catalog") return;
+  if (appPage !== "catalog" || view !== viewSeq) return;
   if (detailKind === "dataset") await openDataset(scopeDataset);
   else if (detailKind === "model" && current) await openModel(current);
   else { search(); if (detailKind === "table" && current) await open(current); }
 }
 
 async function startRefresh() {
+  if (refreshBusy()) return;
   const split = s => s.split(/[\s,]+/).filter(Boolean);
   const projects = [...new Set([...selectedProjects, ...split($("#refresh-projects").value)])];
   const datasets = [...new Set([...selectedDatasets, ...split($("#refresh-datasets").value)])];
   if (!projects.length && !datasets.length) { $("#refresh-error").textContent = "Select a project or dataset to refresh."; return; }
-  $("#start-refresh").disabled = true; $("#refresh-error").textContent = "";
-  ++refreshGeneration;
+  $("#refresh-error").textContent = "";
   const my = viewSeq;
   try {
-    refreshState = await api("/api/refresh", {projects, datasets,
+    await submitRefresh({projects, datasets,
       inventory_only: $("#refresh-mode").value === "inventory", include_datasets: split($("#refresh-include").value),
       exclude_datasets: split($("#refresh-exclude").value), include_hidden: $("#refresh-hidden").checked,
       project_concurrency: Number($("#refresh-concurrency").value), resume: false});
-    updateRefreshProgress(); pollRefresh();
-  } catch (err) { if (my === viewSeq) { $("#refresh-error").textContent = err.message; $("#start-refresh").disabled = false; } }
+  } catch (err) { if (my === viewSeq) $("#refresh-error").textContent = err.message; }
 }
 
 async function pollRefresh() {
-  if (refreshPolling) return;
-  clearTimeout(refreshTimer); refreshPolling = true;
-  const generation = refreshGeneration;
+  if (refreshFlow.polling === "reading" || refreshFlow.submission === "submitting") return;
+  clearTimeout(refreshFlow.timer); refreshFlow.polling = "reading";
+  const generation = refreshFlow.generation;
   try {
     const state = await api("/api/refresh");
-    if (generation !== refreshGeneration) return;
+    if (generation !== refreshFlow.generation) return;
     refreshState = state;
     updateRefreshProgress();
-    const imported = `${state.id}:${state.progress?.done || 0}`;
-    if (isRefreshing() && importedProgress !== imported) {
-      importedProgress = imported;
+    const imported = `${state.id}:${state.started_at}:${state.progress?.datasets_done || 0}:${state.progress?.done || 0}`;
+    if (isRefreshing() && refreshFlow.imported !== imported) {
+      refreshFlow.imported = imported;
       await Promise.all([loadCatalog(), loadStats()]);
       if (appPage === "catalog") search();
     }
-    if (!isRefreshing() && refreshState.id && completedRefresh !== refreshState.id) {
-      completedRefresh = refreshState.id;
+    if (generation !== refreshFlow.generation) return;
+    const completion = `${state.id}:${state.started_at}:${state.finished_at}:${state.status}`;
+    if (!isRefreshing() && state.id && refreshFlow.completed !== completion) {
       await reloadCatalog();
+      if (generation !== refreshFlow.generation) return;
+      refreshFlow.completed = completion;
     }
-    if (isRefreshing()) refreshTimer = setTimeout(pollRefresh, 1000);
+    if (isRefreshing()) refreshFlow.timer = setTimeout(pollRefresh, 1000);
   } catch (err) {
-    if (generation !== refreshGeneration) return;
+    if (generation !== refreshFlow.generation) return;
     $("#refresh-banner").hidden = false;
     $("#refresh-banner").textContent = "Cannot read refresh progress: " + err.message + " Retrying…";
-    refreshTimer = setTimeout(pollRefresh, 3000);
+    refreshFlow.timer = setTimeout(pollRefresh, 3000);
   } finally {
-    refreshPolling = false;
-    if (generation !== refreshGeneration) refreshTimer = setTimeout(pollRefresh, 0);
+    refreshFlow.polling = "idle";
+    if (generation !== refreshFlow.generation) refreshFlow.timer = setTimeout(pollRefresh, 0);
   }
 }
 
@@ -368,17 +394,15 @@ async function openModel(fqn) {
 
 async function openProject(e) {
   e.preventDefault();
+  if (refreshBusy()) return;
   const project = $("#project-id").value.trim();
   const my = viewSeq;
   if (!project) { $("#project-error").textContent = "Enter a project ID."; return; }
-  projectOpening = true; $("#open-project").disabled = true; $("#project-error").textContent = "";
-  ++refreshGeneration;
+  $("#project-error").textContent = "";
   try {
-    refreshState = await api("/api/refresh", {projects:[project], datasets:[]});
-    if (my === viewSeq) overview(project);
-    updateRefreshProgress(); pollRefresh();
+    const started = await submitRefresh({projects:[project], datasets:[]});
+    if (started && my === viewSeq) overview(project);
   } catch (err) { $("#project-error").textContent = err.message; }
-  finally { projectOpening = false; $("#open-project").disabled = isRefreshing(); }
 }
 
 // Declared keys, storage and lineage. Missing values are unknown, so their rows are omitted.
@@ -668,8 +692,12 @@ $("#more").onclick = () => { if (nextOffset != null) search(nextOffset); };
 $("#list").addEventListener("click", e => { const r = e.target.closest(".r"); if (r) open(r.dataset.fqn); });
 document.addEventListener("keydown", e => { if (appPage === "catalog" && e.key === "/" && document.activeElement.tagName !== "INPUT" && document.activeElement.tagName !== "TEXTAREA") { e.preventDefault(); $("#q").focus(); } });
 
-function loadStats() { return api("/api/stats").then(s => { $("#stats").textContent = `${s.datasets} datasets · ${num(s.tables)} tables${s.routines ? ` · ${num(s.routines)} routines` : ""} · ${bytes(s.bytes)} · harvested ${ago(s.harvested_at)}`; })
-  .catch(err => { $("#stats").textContent = err.message; });
+async function loadStats() {
+  const my = ++statsSeq;
+  try {
+    const s = await api("/api/stats");
+    if (my === statsSeq) $("#stats").textContent = `${s.datasets} datasets · ${num(s.tables)} tables${s.routines ? ` · ${num(s.routines)} routines` : ""} · ${bytes(s.bytes)} · harvested ${ago(s.harvested_at)}`;
+  } catch (err) { if (my === statsSeq) $("#stats").textContent = err.message; }
 }
 loadStats();
 const catalogReady = loadCatalog();

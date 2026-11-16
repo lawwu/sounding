@@ -352,3 +352,87 @@ test('resume uses the saved import scope rather than current selections', async 
   h.resolve('/api/refresh', {status:'complete',datasets:[],projects:[]}); await starting;
   h.resolve('/api/refresh', {status:'idle'});
 });
+
+test('all import entry points share one submission gate across navigation', async () => {
+  const h = harness(); await new Promise(resolve => setImmediate(resolve));
+  h.run('refreshState = {id:"saved",status:"interrupted",requested_projects:["p"],requested_datasets:[]}; refreshPage(null, "p.d")');
+  const starting = h.run('startRefresh()');
+  assert.equal(h.element('#start-refresh').disabled, true);
+  assert.equal(h.element('#resume-import').disabled, true);
+  assert.equal(h.element('#open-project').disabled, true);
+  h.element('#project-id').value = 'other';
+  await h.run('openProject({preventDefault(){}})');
+  await h.element('#resume-import').onclick();
+  h.run('reportPage(); refreshPage(null, "p.other")');
+  await h.run('startRefresh()');
+  await h.run('pollRefresh()');
+  assert.equal(h.pending.filter(p => p.url === '/api/refresh' && p.options.method === 'POST').length, 1);
+  assert.equal(h.pending.filter(p => p.url === '/api/refresh' && !p.done && !p.options.method).length, 0);
+  h.resolve('/api/refresh', {error:'Try again.'}, false); await starting;
+  assert.equal(h.element('#start-refresh').disabled, false);
+  assert.equal(h.element('#resume-import').disabled, false);
+  assert.equal(h.element('#open-project').disabled, false);
+  // A failed response may still have started the server job: reconcile with GET.
+  assert.ok(h.pending.some(p => p.url === '/api/refresh' && !p.done && !p.options.method));
+  h.resolve('/api/refresh', {status:'idle'});
+});
+
+test('stopped refresh progress never implies that unfinished datasets completed', () => {
+  const h = harness();
+  h.context.state = {status:'interrupted',phase:'harvesting',progress:{datasets_done:1,datasets_total:4}};
+  assert.match(h.run('progressHtml(state)'), /max="4" value="1"/);
+  h.context.state = {status:'failed',phase:'discovering',progress:{datasets_done:0,datasets_total:0}};
+  assert.match(h.run('progressHtml(state)'), /max="1" value="0"/);
+  h.context.state = {status:'running',phase:'discovering'};
+  assert.doesNotMatch(h.run('progressHtml(state)'), /value=/);
+  h.context.state = {status:'complete',phase:'finished',progress:{datasets_done:0,datasets_total:0}};
+  assert.match(h.run('progressHtml(state)'), /max="1" value="1"/);
+});
+
+test('a resumed import reloads the catalog even when its id is unchanged', async () => {
+  const h = harness(); await new Promise(resolve => setImmediate(resolve));
+  h.run('reportPage()');
+  for (const stamp of ['2026-11-15T10:00:00Z', '2026-11-15T11:00:00Z']) {
+    const poll = h.run('pollRefresh()');
+    h.resolve('/api/refresh', {id:'same-import',status:'complete',started_at:stamp,finished_at:stamp,projects:[],datasets:[]});
+    await new Promise(resolve => setImmediate(resolve));
+    h.resolve('/api/browse', {projects:[]});
+    h.resolve('/api/stats', {datasets:0,tables:0,bytes:0});
+    await poll;
+  }
+  assert.equal(h.pending.filter(p => p.url === '/api/browse').length, 3);
+});
+
+test('older catalog counts and failures cannot replace newer statistics', async () => {
+  const h = harness(); await new Promise(resolve => setImmediate(resolve));
+  const old = h.run('loadStats()'), latest = h.run('loadStats()');
+  const requests = h.pending.filter(p => p.url === '/api/stats' && !p.done);
+  requests[1].done = true;
+  requests[1].resolve({ok:true,json:async()=>({datasets:2,tables:20,bytes:200})});
+  await latest;
+  requests[0].resolve({ok:false,json:async()=>({error:'Old request failed'})});
+  await old;
+  assert.match(h.element('#stats').textContent, /2 datasets · 20 tables/);
+});
+
+test('a catalog reload cannot reopen a table selected while it was waiting', async () => {
+  const h = harness(); await new Promise(resolve => setImmediate(resolve));
+  await show(h, 'p.d.A');
+  const reload = h.run('reloadCatalog()');
+  await show(h, 'p.d.B');
+  h.element('#sql').value = 'SELECT my_current_draft';
+  h.resolve('/api/browse', {projects:[]});
+  h.resolve('/api/stats', {datasets:1,tables:2,bytes:16});
+  await reload;
+  assert.equal(h.pending.filter(p => p.url === '/api/table?fqn=p.d.B').length, 1);
+  assert.equal(h.element('#sql').value, 'SELECT my_current_draft');
+});
+
+test('submission rejection is shown separately from the saved import state', () => {
+  const h = harness();
+  h.context.saved = {status:'complete',submission_error:'Resume rejected <script>',progress:{datasets_done:1,datasets_total:1}};
+  const html = h.run('progressHtml(saved)');
+  assert.match(html, /Refresh complete/);
+  assert.match(html, /Last refresh request: Resume rejected &lt;script&gt;/);
+  assert.doesNotMatch(html, /<script>/);
+});

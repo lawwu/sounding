@@ -99,6 +99,61 @@ def test_hydration_rejects_concurrent_refresh_and_preserves_samples(seed, monkey
         catalog.save_table_metadata('p.d.t', sid, row, cols)
 
 
+def test_older_hydration_cannot_overwrite_newer_metadata_or_measurements(seed, monkeypatch):
+    seed()
+    older = Mock()
+    older.get_table.return_value = remote_table('t', [field('old')])
+    newer = Mock()
+    newer.get_table.return_value = remote_table('t', [field('new')])
+    monkeypatch.setattr(bq, 'client', Mock(side_effect=[older, newer]))
+    def policies(client, remote):
+        if client is older:
+            # A newer load finishes while the older request is waiting on policies.
+            bq.load_table_metadata('p.d.t')
+            with catalog.connect(write=True) as con:
+                table_id = con.execute('SELECT table_snapshot_id FROM tables WHERE fqn=?', ['p.d.t']).fetchone()[0]
+                con.execute('INSERT INTO column_measurements VALUES (?, ?, ?)', [table_id, 'new', 42])
+        return {'row_access_policies_status':'harvested', 'row_access_policies':[]}
+    monkeypatch.setattr(bq, 'row_access_policies', policies)
+    with pytest.raises(ValueError, match='catalog changed while loading metadata'):
+        bq.load_table_metadata('p.d.t')
+    with catalog.connect() as con:
+        columns = catalog.describe(con, 'p.d.t')['columns']
+        assert [(c['path'], c['scan_bytes']) for c in columns] == [('new', 42)]
+    older.close.assert_called_once()
+    newer.close.assert_called_once()
+
+
+def test_sample_attachment_does_not_invalidate_pending_metadata_load(seed):
+    sid = seed()
+    with catalog.connect() as con:
+        revision = catalog.metadata_revision(con, 'p.d.t')
+    sample = {'preview_rows':[{'id':'keep'}], 'preview_status':'harvested',
+              'preview_message':None, 'preview_sampled_at':None}
+    assert catalog.save_sample('p.d.t', sid, sample)
+    row, columns = bq.table_record(remote_table().to_api_repr(), 'p.d')
+    catalog.save_table_metadata('p.d.t', sid, row, columns, expected_revision=revision)
+    with catalog.connect() as con:
+        assert catalog.describe(con, 'p.d.t')['preview_rows'] == [{'id':'keep'}]
+
+
+def test_identical_metadata_reloads_retain_existing_cost_invalidation(seed):
+    sid = seed()
+    row, columns = bq.table_record(remote_table().to_api_repr(), 'p.d')
+    catalog.save_table_metadata('p.d.t', sid, row, columns)
+    with catalog.connect() as con:
+        revision = catalog.metadata_revision(con, 'p.d.t')
+    # Another explicit load republishes the same metadata, then costs are saved.
+    catalog.save_table_metadata('p.d.t', sid, row, columns, expected_revision=revision)
+    with catalog.connect(write=True) as con:
+        table_id = con.execute('SELECT table_snapshot_id FROM tables WHERE fqn=?', ['p.d.t']).fetchone()[0]
+        con.execute('INSERT INTO column_measurements VALUES (?, ?, ?)', [table_id, columns[0]['path'], 42])
+    catalog.save_table_metadata('p.d.t', sid, row, columns, expected_revision=revision)
+    with catalog.connect() as con:
+        assert catalog.metadata_revision(con, 'p.d.t') == revision
+        assert con.execute('SELECT count(*) FROM column_measurements').fetchone()[0] == 0
+
+
 def test_filters_receipts_resume_and_transient_retry(monkeypatch):
     discovery, seen = Mock(return_value={'datasets':['p.prod','p.stage','p._hidden'], 'unreachable':[], 'receipt':{}}), []
     monkeypatch.setattr(bq,'project_datasets',discovery)

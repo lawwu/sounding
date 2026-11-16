@@ -374,12 +374,25 @@ def save_snapshot(dataset: str, table_rows: list[dict], col_rows: list[dict],
     return sid
 
 
-def save_table_metadata(fqn, snapshot_id, row, columns):
+def metadata_revision(con, fqn):
+    """Compare saved metadata across unlocked reads; samples have a separate lifetime.
+
+    Schemas use their stored identities, so this does not expand schema contents.
+    Measurements live separately and do not change the metadata revision.
+    """
+    return con.execute(LATEST + """ SELECT * EXCLUDE
+        (preview_rows, preview_status, preview_message, preview_sampled_at)
+        FROM current_tables WHERE fqn=?""", [fqn]).fetchone()
+
+
+def save_table_metadata(fqn, snapshot_id, row, columns, *, expected_revision=None):
     from .errors import SoundingError
     with connect(write=True) as con:
         current = con.execute(LATEST + ' SELECT snapshot_id,table_snapshot_id FROM current_tables WHERE fqn=?', [fqn]).fetchone()
         if not current or current[0] != snapshot_id:
             raise SoundingError("The catalog changed while loading metadata. Retry against the new snapshot.")
+        if expected_revision is not None and metadata_revision(con, fqn) != expected_revision:
+            raise SoundingError("The catalog changed while loading metadata. Retry against the current table metadata.")
         table_id = current[1]
         con.execute('BEGIN')
         try:
