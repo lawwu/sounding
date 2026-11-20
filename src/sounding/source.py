@@ -181,8 +181,8 @@ def job_pages(project: str, since: dt.datetime, until: dt.datetime, *, client: b
     if until - since > dt.timedelta(days=JOB_HISTORY_DAYS):
         raise SoundingError(f"A window is at most {JOB_HISTORY_DAYS} days, the job history BigQuery keeps.")
     integer(page_size, "page_size", 1, 1000)
-    listing = dict(project=project, all_users=all_users, page_size=page_size, timeout=30)
-    for page in client.list_jobs(**listing, min_creation_time=since, max_creation_time=until).pages:
+    listing = dict(project=project, page_size=page_size, timeout=30)
+    for page in client.list_jobs(**listing, all_users=all_users, min_creation_time=since, max_creation_time=until).pages:
         jobs, other = [], 0
         for job in page:
             if job.job_type != "query":
@@ -191,6 +191,7 @@ def job_pages(project: str, since: dt.datetime, until: dt.datetime, *, client: b
             record = job_record(job, include_sql=include_sql)
             jobs.append(record)
             if record["child_jobs"]:
+                # BigQuery rejects all_users together with a parent job; a script's children list without it
                 for children in client.list_jobs(**listing, parent_job=job.job_id).pages:
                     jobs.extend(job_record(child, include_sql=include_sql) for child in children if child.job_type == "query")
         yield {"jobs": jobs, "other_jobs": other, "unreachable": sorted((page._raw_page or {}).get("unreachable", [])),
