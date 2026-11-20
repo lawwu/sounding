@@ -39,6 +39,7 @@ def client_for(pages, children=None, unreachable=()):
 
     def list_jobs(**kwargs):
         if kwargs.get('parent_job'):
+            assert 'all_users' not in kwargs, 'BigQuery answers 400: all_users and parent_job_id cannot be combined'
             return NS(pages=iter([Page((children or {})[kwargs['parent_job']])]))
         return NS(pages=iter([Page(p) for p in pages]))
     return Mock(project='default-p', list_jobs=Mock(side_effect=list_jobs))
