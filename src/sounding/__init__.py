@@ -6,5 +6,5 @@ in the README. The other Python modules in this package are internal and may cha
 release.
 """
 
-__version__ = "0.8.1"
+__version__ = "0.9.0"
 __all__ = ["__version__"]
