@@ -510,10 +510,56 @@ any minor release may break things, and its release notes say so when it does. F
   monitoring SQL requires explicit opt-in and a byte cap; user-supplied SQL remains
   dry-run only. Results carry cost evidence, and unknown cost remains unknown, never zero.
 
-**The Python modules are internal.** `sounding.bq`, `sounding.catalog`, `sounding.ui`,
+- **`sounding.source`:** the function names, arguments and record keys described under
+  [From Python](#from-python), with the same allowance for added keys.
+
+**The other Python modules are internal.** `sounding.bq`, `sounding.catalog`, `sounding.ui`,
 `sounding.mcp_server` and the rest may change in any release, including patch releases,
-without notice. Use the CLI or the MCP server instead. If you need to drive Sounding from
-Python, open an issue: a small public API can be designed for that.
+without notice. Use the CLI, the MCP server or `sounding.source` instead.
+
+## From Python
+
+`sounding.source` is for a program that keeps its own store and wants Sounding's BigQuery
+reads without the local catalog. Its calls are free (`tables.get` and `jobs.list`), return
+plain dictionaries, and never open the catalog file. You pass your own client and close it.
+
+```python
+import datetime as dt
+from google.cloud import bigquery
+from sounding import source
+
+client = bigquery.Client(project="my-job-project")
+until = dt.datetime.now(dt.UTC)
+
+found = source.table("my-project.features.shift_inputs", client=client)
+found["table"]["base_table"]          # set for a snapshot or clone
+[c["path"] for c in found["columns"]]  # nested fields by dotted path
+
+for page in source.job_pages("my-job-project", until - dt.timedelta(days=1), until, client=client):
+    for job in page["jobs"]:
+        job["job_id"], job["referenced_tables"], job["destination_table"]
+```
+
+- **`table(fqn, *, client)`** returns `{"table", "columns", "receipt"}`. The table row has the
+  same fields `sounding describe` reports, and `table["resource"]` keeps the rest of the
+  REST response.
+- **`job_pages(project, since, until, *, client, all_users=True, include_sql=False)`** yields
+  every query job the project created in the window, one page of `jobs.list` at a time.
+  Each job carries its project, location and ID, its parent job, times, state, statement
+  type, error reason, cache hit, processed and billed bytes, slot time, the tables it
+  reported reading, and its destination. `destination_temporary` is true when the
+  destination is BigQuery's hidden results dataset.
+  - A script is followed by its child jobs in the same page. Sum bytes over parents or
+    over children, not both.
+  - Jobs in every state are returned, including running and failed ones. Cache hits and
+    failed jobs often report no tables.
+  - SQL text is returned only with `include_sql=True`. Error messages and user emails are
+    never returned.
+  - `all_users=True` needs `bigquery.jobs.listAll` on the project.
+  - `jobs.list` has no normalized query hash. That hash exists only in
+    `INFORMATION_SCHEMA`, which `query-opportunities` reads under a byte cap.
+  - If a call fails part-way the generator raises. Record a window as done only after
+    the last page.
 
 ## Development
 

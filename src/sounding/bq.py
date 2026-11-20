@@ -1,4 +1,4 @@
-"""The only module that calls BigQuery.
+"""Every BigQuery call that feeds the local catalog. `source` holds the reads that need no catalog.
 
 Metadata, previews and user-SQL dry runs are free. The separate opt-in workload
 scan executes fixed INFORMATION_SCHEMA SQL with a byte cap; never business SQL.
@@ -27,6 +27,8 @@ from requests.exceptions import RequestException
 from . import catalog, workload, recommendations
 from .progress import Quiet
 from .errors import SoundingError, integer, text, public_error
+from .source import (PRICING_DOC, STORAGE_FIELDS, TABLE_DROP, _int, _iso, _ms, _partitioning, _ref,  # noqa: F401
+                     flatten, free_api_receipt, sql_type, table_record)
 
 JOB_PROJECT = os.environ.get("SOUNDING_JOB_PROJECT")
 GET_TABLE_WORKERS = 16  # concurrent tables.get / routines.get calls within one dataset
@@ -34,7 +36,6 @@ DATASET_WORKERS = 4     # datasets harvested at once; up to 4 x 16 requests in f
 DRY_RUN_WORKERS = 16    # concurrent column-cost dry runs, well under BigQuery's per-user API rate
 MAX_SQL_LENGTH = 100_000
 PRICE_BASIS = "US on-demand scan list price ($6.25/TiB); excludes free tier, discounts and other services."
-PRICING_DOC = "https://cloud.google.com/bigquery/pricing#free"
 COST_REPORT_MAX_HOURS = 180 * 24  # BigQuery keeps job history for 180 days
 COST_REPORT_MAX_JOBS = 1000
 PSEUDO_PARTITION_COLUMNS = {"_PARTITIONTIME", "_PARTITIONDATE"}  # ingestion-time partitioning
@@ -66,104 +67,8 @@ def project_datasets(project: str, *, include_hidden=False) -> dict:
 # once by content hash so newer field metadata survives without per-table copies.
 # Dataset `access` lists the people and groups with access (emails),
 # which a metadata catalog has no reason to keep.
-TABLE_DROP = {"view", "etag", "selfLink", "id", "kind"}
 DATASET_DROP = {"access", "etag", "selfLink", "id", "kind"}
 ROUTINE_DROP = {"etag"}
-STORAGE_FIELDS = {  # tables.get returns these by default; any may be absent (unknown).
-    "numActiveLogicalBytes": "active_logical", "numLongTermLogicalBytes": "long_term_logical",
-    "numTotalLogicalBytes": "total_logical", "numActivePhysicalBytes": "active_physical",
-    "numLongTermPhysicalBytes": "long_term_physical", "numTotalPhysicalBytes": "total_physical",
-    "numTimeTravelPhysicalBytes": "time_travel_physical", "numCurrentPhysicalBytes": "current_physical",
-}
-
-
-def flatten(fields: list[dict], prefix=""):
-    """Yield (path, field) for every REST schema field, including RECORD parents and children."""
-    for f in fields:
-        path = f"{prefix}{f['name']}"
-        yield path, f
-        if f.get("type") in ("RECORD", "STRUCT"):
-            yield from flatten(f.get("fields", []), path + ".")
-
-
-def _int(value) -> int | None:
-    """REST int64 fields arrive as strings; absent stays None (unknown), never 0."""
-    return None if value is None else int(value)
-
-
-def _ms(value) -> dt.datetime | None:
-    return None if value is None else dt.datetime.fromtimestamp(int(value) / 1000, dt.UTC)
-
-
-def _ref(r: dict | None, key="tableId") -> str | None:
-    return f"{r['projectId']}.{r['datasetId']}.{r[key]}" if r else None
-
-
-def _partitioning(r: dict) -> str | None:
-    if tp := r.get("timePartitioning"):
-        return f"{tp['type']}:{tp.get('field') or '_PARTITIONTIME'}"
-    if rp := r.get("rangePartitioning"):
-        return f"RANGE:{rp['field']}"
-    return None
-
-
-def sql_type(t: dict | None) -> str | None:
-    """A GoogleSQL type name from a REST StandardSqlDataType."""
-    if not t:
-        return None
-    kind = t.get("typeKind")
-    if kind == "ARRAY":
-        return f"ARRAY<{sql_type(t.get('arrayElementType'))}>"
-    if kind == "STRUCT":
-        fields = t.get("structType", {}).get("fields", [])
-        return "STRUCT<" + ", ".join(f"{f.get('name', '')} {sql_type(f.get('type'))}".strip() for f in fields) + ">"
-    if kind == "RANGE":
-        return f"RANGE<{sql_type(t.get('rangeElementType'))}>"
-    return kind
-
-
-def table_record(r: dict, dataset: str) -> tuple[dict, list[dict]]:
-    """One tables.get response as a catalog row and its column rows."""
-    fqn = _ref(r["tableReference"])
-    partitioning = _partitioning(r)
-    constraints = r.get("tableConstraints") or {}
-    copy = r.get("snapshotDefinition") or r.get("cloneDefinition")
-    mv = r.get("materializedView")
-    storage = {name: int(r[key]) for key, name in STORAGE_FIELDS.items() if r.get(key) is not None}
-    # requirePartitionFilter moved from timePartitioning to the table; BigQuery omits false.
-    require = r.get("requirePartitionFilter", (r.get("timePartitioning") or {}).get("requirePartitionFilter"))
-    table = {
-        "dataset": dataset, "table_id": r["tableReference"]["tableId"], "fqn": fqn, "type": r.get("type"),
-        "num_rows": _int(r.get("numRows")), "num_bytes": _int(r.get("numBytes")),
-        "created": _ms(r.get("creationTime")), "modified": _ms(r.get("lastModifiedTime")),
-        "partitioning": partitioning,
-        "clustering": ",".join(r["clustering"]["fields"]) if r.get("clustering") else None,
-        "description": r.get("description"),
-        "view_sql": (r.get("view") or {}).get("query") or (mv or {}).get("query"),
-        "location": r.get("location"), "expires": _ms(r.get("expirationTime")),
-        "labels": r.get("labels") or {},
-        "require_partition_filter": bool(require) if partitioning else None,
-        "partition_expiration_ms": _int((r.get("timePartitioning") or {}).get("expirationMs")),
-        "num_partitions": _int(r.get("numPartitions")),
-        "primary_key": (constraints.get("primaryKey") or {}).get("columns"),
-        "foreign_keys": [{"name": fk.get("name"), "references": _ref(fk.get("referencedTable")),
-                          "columns": [[c["referencingColumn"], c["referencedColumn"]] for c in fk.get("columnReferences", [])]}
-                         for fk in constraints.get("foreignKeys", [])] or None,
-        "storage": storage or None,
-        "kms_key": (r.get("encryptionConfiguration") or {}).get("kmsKeyName"),
-        "base_table": _ref((copy or {}).get("baseTableReference")),
-        "base_kind": ("SNAPSHOT" if r.get("snapshotDefinition") else "CLONE") if copy else None,
-        "external": r.get("externalDataConfiguration"),
-        "materialized_view": ({k: v for k, v in mv.items() if k != "query"} | {"status": r.get("materializedViewStatus")}
-                              if mv else None),
-        "resource": {k: v for k, v in r.items() if k not in TABLE_DROP},
-    }
-    columns = [{"fqn": fqn, "path": path, "type": f.get("type"), "mode": f.get("mode", "NULLABLE"),
-                "description": f.get("description"), "policy_tags": (f.get("policyTags") or {}).get("names")}
-               for path, f in flatten((r.get("schema") or {}).get("fields", []))]
-    return table, columns
-
-
 def dataset_record(r: dict, dataset: str, routines_status: str) -> dict:
     return {"dataset": dataset, "location": r.get("location"), "friendly_name": r.get("friendlyName"),
             "description": r.get("description"), "labels": r.get("labels") or {},
@@ -502,13 +407,6 @@ def combine_receipts(receipts: list[dict]) -> dict:
             "source": "BigQuery's response to each dry run"}
 
 
-def free_api_receipt(*calls: str) -> dict:
-    """Metadata and tabledata.list calls are not jobs, and BigQuery returns no billing fields for them."""
-    return {"call": ", ".join(calls), "jobs_created": 0, "free": True,
-            "source": f"Not a job: BigQuery lists these calls as free ({PRICING_DOC}) and returns no "
-                      "billing fields for them. `sounding cost-report` shows any job a project ran."}
-
-
 def dry_run(sql: str) -> dict:
     text(sql, "sql", MAX_SQL_LENGTH)
     # Every statement, INFORMATION_SCHEMA included, is submitted only as a dry run, which
@@ -695,10 +593,6 @@ def preview(fqn: str, n: int = 5) -> dict:
         raise SoundingError("Preview supports native tables and snapshots only, not views or external tables.")
     rows = [_json_value(dict(row.items())) for row in c.list_rows(table, max_results=n)]
     return {"rows": rows, "receipt": free_api_receipt("tables.get", "tabledata.list")}
-
-
-def _iso(when: dt.datetime | None) -> str | None:
-    return None if when is None else when.astimezone(dt.UTC).isoformat()
 
 
 def cost_report(hours: int = 24) -> dict:
